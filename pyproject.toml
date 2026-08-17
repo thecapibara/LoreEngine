@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loreengine"
+version = "0.1.0"
+description = "A lightweight world-wiki engine for LLM-driven games — a zero-dependency RAG alternative"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Vitaly" }]
+keywords = ["llm", "games", "rag", "lore", "worldbuilding", "prompt-engineering"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment :: Role-Playing",
+]
+# No runtime dependencies — pure stdlib by design.
+dependencies = []
+
+[project.scripts]
+loreengine-lint = "loreengine.__main__:main"
+
+[tool.setuptools]
+packages = ["loreengine"]
+
+[tool.setuptools.package-data]
+loreengine = ["py.typed"]
+
+[tool.mypy]
+# The package ships py.typed — annotations are a promise; keep them verified.
+strict = true

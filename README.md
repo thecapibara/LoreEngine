@@ -90,7 +90,10 @@ game needs guarantees, not vibes.
 - **Fuzzy prefix matching** — handles case endings and inflection:
   `dragon` ≈ `dragons` ≈ `dragonkin`, and short stems too: `ліс` ≈ `лісу`,
   `cat` ≈ `cats`. Hyphenated names split into words, so an alias
-  `Jean-Luc Picard` is found by the query `Jean Luc`;
+  `Jean-Luc Picard` is found by the query `Jean Luc` — but when a split
+  would leave a fragment shorter than 3 chars, the pieces glue back
+  together instead, so `90-ті` stays searchable as `90ті` (and reaches a
+  latin key like `lyhi_90ti` through the transliteration bridge);
 - **Inverted prefix index** — queries narrow to candidate pages via a
   3-char prefix index before the precise TF-IDF ranker runs. Results are
   identical to a full scan (the index is a guaranteed superset, verified by
@@ -102,7 +105,8 @@ game needs guarantees, not vibes.
   expands the query with the strongest semantic neighbors, weighted below
   exact keywords, so a player action about *drinks and rumors* can surface a
   tavern page that never uses those words. Deterministic, no vectors, no
-  model calls.
+  model calls. Ties are broken deterministically by page key, so equal
+  scores never depend on filesystem enumeration order.
 
 ## Scale
 
@@ -249,7 +253,7 @@ wiki you can lint and query right away.
 ## Development
 
 ```bash
-# Tests (55 tests: search, semantics, scale, linter, review regressions)
+# Tests (59 tests: search, semantics, scale, linter, review regressions)
 python -m unittest discover -s tests -v
 
 # Type checking (strict; the package ships py.typed)

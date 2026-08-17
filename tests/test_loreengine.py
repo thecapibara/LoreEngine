@@ -7,7 +7,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from loreengine import LoreEngine, UK, EN, lint_kb, normalize, words_match
+from loreengine import LoreEngine, UK, EN, lint_kb, normalize, tokenize, words_match
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXAMPLE_KB = os.path.join(HERE, "..", "examples", "knowledge_base")
@@ -592,6 +592,45 @@ class TestScale(unittest.TestCase):
             # Determinism: rebuild yields identical neighbor maps.
             engine2 = LoreEngine(tmp, lang=EN, verbose=False)
             self.assertEqual(engine._cooc, engine2._cooc)
+
+
+class TestTokenize(unittest.TestCase):
+    """Punctuation-split chunks with a short fragment glue back together."""
+
+    def test_short_fragment_glues(self):
+        # "90-ті" must not vanish as two sub-3-char fragments.
+        self.assertEqual(tokenize("90-ті"), ["90ті"])
+        self.assertEqual(tokenize("35-ти"), ["35ти"])
+        self.assertEqual(tokenize("сім'ю"), ["сімю"])
+
+    def test_long_fragments_stay_split(self):
+        self.assertEqual(tokenize("Jean-Luc"), ["jean", "luc"])
+        self.assertEqual(tokenize("студентка-практикантка"),
+                         ["студентка", "практикантка"])
+
+    def test_glued_token_reaches_latin_key(self):
+        # The NoireV2 regression: query "90-ті" must find key lyhi_90ti
+        # through the transliteration bridge (90ті -> 90ti).
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "lyhi_90ti.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Легенди 90-х — бандити, бартер і беззаконня.\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            doc = engine.search_one("Слухаю плітки про 90-ті")
+            self.assertTrue(doc and doc["key"] == "lyhi_90ti", f"got {doc}")
+
+    def test_glued_body_word_searchable(self):
+        # A glued token in the body is indexed and findable by the same
+        # glued query form.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "era.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Це була епоха 90-тих років.\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            doc = engine.search_one("90-тих")
+            self.assertTrue(doc and doc["key"] == "era", f"got {doc}")
 
 if __name__ == "__main__":
     unittest.main()

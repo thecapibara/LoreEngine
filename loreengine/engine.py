@@ -102,6 +102,31 @@ def words_match(w1: str, w2: str) -> bool:
     return False
 
 
+def tokenize(text: str) -> List[str]:
+    """Words for indexing and search.
+
+    Like :func:`normalize`, but when punctuation splits a chunk and ANY
+    fragment is shorter than 3 chars, the fragments are glued back
+    together: ``90-ті`` -> ``90ті``, ``сім'ю`` -> ``сімя``. Short
+    fragments fall below the 3-char search floor and would otherwise
+    vanish from both queries and indexes, losing matches like the query
+    ``90-ті`` against the key ``lyhi_90ti`` (via transliteration).
+    Chunks whose fragments are all long keep the split, so ``Jean-Luc``
+    -> ``jean luc`` and each part stays searchable on its own.
+    """
+    s = unicodedata.normalize("NFC", text or "").lower()
+    words: List[str] = []
+    for chunk in s.split():
+        parts = [p for p in re.split(r"[^\w]+", chunk) if p]
+        if not parts:
+            continue
+        if len(parts) > 1 and any(len(p) < 3 for p in parts):
+            words.append("".join(parts))
+        else:
+            words.extend(parts)
+    return words
+
+
 class LoreDocument(TypedDict):
     """Public shape of a page dict in ``LoreEngine.documents``."""
 
@@ -246,14 +271,14 @@ class LoreEngine:
                     "tags": tags,
                 }
                 self.documents.append(doc)
-                key_words = set(normalize(key + " " + doc["name"]).split())
+                key_words = set(tokenize(key + " " + doc["name"]))
                 for alias in aliases:
-                    key_words |= set(normalize(alias).split())
+                    key_words |= set(tokenize(alias))
                 # Tags are a deterministic synonym bridge the author controls
                 # (e.g. Tags: beer, drinks on a tavern page) — index them.
                 for tag in tags:
-                    key_words |= set(normalize(tag).split())
-                body_words = set(normalize(content).split())
+                    key_words |= set(tokenize(tag))
+                body_words = set(tokenize(content))
                 self._words.append(body_words)
                 bp: Dict[str, Set[str]] = {}
                 for bw in body_words:
@@ -416,7 +441,7 @@ class LoreEngine:
 
     def _query_words(self, query: str) -> List[str]:
         """Meaningful query words (>=3 chars, minus stopwords)."""
-        return [w for w in normalize(query).split()
+        return [w for w in tokenize(query)
                 if len(w) >= 3 and w not in self.lang.stopwords]
 
     def _expand(self, words: List[str]) -> Tuple[List[str], List[float]]:
@@ -608,7 +633,9 @@ class LoreEngine:
             s = self._score_doc(i, exp_words, weights)
             if s > 0:
                 scored.append((s, i))
-        scored.sort(key=lambda x: -x[0])
+        # Deterministic tie-break by page key (not scan order), so equal
+        # scores never depend on filesystem enumeration order.
+        scored.sort(key=lambda x: (-x[0], self.documents[x[1]]["key"]))
         return [self.documents[i] for _, i in scored[:k]]
 
     # --------------------------------------------------------------- helpers

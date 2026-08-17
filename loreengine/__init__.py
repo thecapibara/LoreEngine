@@ -15,14 +15,14 @@ Quick start::
     extra = engine.relevant(player_action, exclude=[d["key"] for d in pages])
 """
 
-from .engine import LoreEngine, LoreDocument, normalize, words_match
+from .engine import LoreEngine, LoreDocument, normalize, tokenize, words_match
 from .lang import LanguagePack, UK, EN, PL, PACKS
 from .lint import lint_kb, Report
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "LoreEngine", "LoreDocument", "normalize", "words_match",
+    "LoreEngine", "LoreDocument", "normalize", "tokenize", "words_match",
     "LanguagePack", "UK", "EN", "PL", "PACKS",
     "lint_kb", "Report",
     "__version__",

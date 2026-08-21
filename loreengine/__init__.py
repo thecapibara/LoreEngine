@@ -19,7 +19,7 @@ from .engine import LoreEngine, LoreDocument, normalize, tokenize, words_match
 from .lang import LanguagePack, UK, EN, PL, PACKS
 from .lint import lint_kb, Report
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "LoreEngine", "LoreDocument", "normalize", "tokenize", "words_match",

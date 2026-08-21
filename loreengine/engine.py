@@ -72,6 +72,7 @@ _COOC_PRUNE_TRIGGER = 8 * _COOC_NEIGHBORS  # prune a word's map past this size
 _COOC_EXPAND = 6       # max expansion words added to a relevant() query
 _COOC_WEIGHT = 0.5     # score multiplier for expansion (semantic) words
 _RELEVANT_MAX_CANDIDATES = 1200  # safety cap on candidate set for relevant()
+_NO_APOSTROPHE = str.maketrans("", "", "'\u2019\u02bc")
 
 
 def normalize(s: str) -> str:
@@ -81,6 +82,10 @@ def normalize(s: str) -> str:
     into searchable words: ``Jean-Luc`` -> ``jean luc``.
     """
     s = unicodedata.normalize("NFC", s or "").lower().strip()
+    # U+02BC MODIFIER LETTER APOSTROPHE is a word character («сімʼю» would
+    # stay one token); route it through the same punctuation path as the
+    # plain and curly apostrophes so all three spellings agree.
+    s = s.replace("\u02bc", "'")
     s = re.sub(r"[^\w\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -88,6 +93,12 @@ def normalize(s: str) -> str:
 def words_match(w1: str, w2: str) -> bool:
     """Fuzzy word comparison: exact match, a shared prefix (case endings),
     or a short-word inflection ("ліс" ~ "лісу", "cat" ~ "cats")."""
+    if w1 == w2:
+        return True
+    # Apostrophes never survive tokenize(), so dropping them here only
+    # reconciles raw spellings: «сімʼю» ~ «сім'ю» ~ «сімю».
+    w1 = w1.translate(_NO_APOSTROPHE)
+    w2 = w2.translate(_NO_APOSTROPHE)
     if w1 == w2:
         return True
     # Short-word inflection: one word extends the other by 1-2 chars
@@ -115,6 +126,7 @@ def tokenize(text: str) -> List[str]:
     -> ``jean luc`` and each part stays searchable on its own.
     """
     s = unicodedata.normalize("NFC", text or "").lower()
+    s = s.replace("\u02bc", "'")  # see normalize(): same apostrophe path
     words: List[str] = []
     for chunk in s.split():
         parts = [p for p in re.split(r"[^\w]+", chunk) if p]
@@ -246,7 +258,7 @@ class LoreEngine:
                 try:
                     with open(os.path.join(cat_path, filename), "r", encoding="utf-8") as f:
                         raw = f.read()
-                except OSError as e:
+                except (OSError, UnicodeDecodeError) as e:
                     self._log(f"[LoreEngine] Could not read {filename}: {e}")
                     continue
                 # Normalize line endings so CRLF files never leak \r into
@@ -488,6 +500,12 @@ class LoreEngine:
             mult = weights[idx] if weights else 1.0
             tw = self._translit(w)
             idf = self._idf(w)
+            if tw != w and self._df.get(tw):
+                # The translit bridge resolved this query word to a latin
+                # word present in the KB — weight it by the latin form's
+                # IDF, not the always-maximal IDF of the unseen native
+                # spelling (df=0).
+                idf = self._idf(tw)
             # Hit on the document key/name/aliases/tags (latin via translit, or native)
             if tw in key_words or w in key_words:
                 score += mult * (3.0 * idf + 2.0)
@@ -565,30 +583,38 @@ class LoreEngine:
 
     def get_pages(self, queries: Iterable[object], max_pages: int = 3) -> List[LoreDocument]:
         """DOCUMENTS for a list of queries (wiki-lookup), deduplicated."""
-        docs, seen = [], set()
+        docs: List[LoreDocument] = []
+        seen = set()
+        if max_pages <= 0:
+            return docs
         for q in queries or []:
             if not isinstance(q, str) or not q.strip():
                 continue
+            # Cap check before the (potentially costly) search: once the
+            # budget is full, stop instead of appending one page past it.
+            if len(docs) >= max_pages:
+                break
             doc = self.search_one(q.strip())
             if doc and doc["key"] not in seen:
                 seen.add(doc["key"])
                 docs.append(doc)
-            if len(docs) >= max_pages:
-                break
         return docs
 
     def pages_for_entities(self, names: Iterable[object], max_pages: int = 6) -> List[LoreDocument]:
         """DOCUMENTS for the entity names of the current scene (dosing)."""
-        docs, seen = [], set()
+        docs: List[LoreDocument] = []
+        seen = set()
+        if max_pages <= 0:
+            return docs
         for name in names or []:
             if not isinstance(name, str) or not name.strip():
                 continue
+            if len(docs) >= max_pages:
+                break
             doc = self.search_one(name.strip())
             if doc and doc["key"] not in seen:
                 seen.add(doc["key"])
                 docs.append(doc)
-            if len(docs) >= max_pages:
-                break
         return docs
 
     def relevant(self, query: str, k: int = 2, exclude: Iterable[str] = ()) -> List[LoreDocument]:

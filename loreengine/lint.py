@@ -42,6 +42,9 @@ DOC_WARN_CHARS = 3500
 
 # Latin snake_case key for knowledge base files
 _KEY_RE = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
+# Quoted names/nicknames in a page's first line. Open/close pairs must
+# match: "X", “X”, «X» — never “X» or «Y”.
+_QUOTED_RE = re.compile(r'"([^"]{3,30})"|“([^”]{3,30})”|«([^»]{3,30})»')
 
 
 class Report:
@@ -98,6 +101,18 @@ def mention_hits_entity(candidate: str, known: str) -> bool:
     return any(loose_words_match(c, k) for c in cw for k in kw)
 
 
+def _same_alias_form(a: str, b: str) -> bool:
+    """Alias case-form duplicate: equal normalized forms, or the same word
+    count with every word pair a fuzzy case-form («Таверна» ~ «Таверни»).
+    Distinct multi-word names («Таверна на Сході» vs «Таверна») differ in
+    word count and are NOT duplicates."""
+    wa, wb = normalize(a).split(), normalize(b).split()
+    if wa == wb:
+        return True
+    return (len(wa) == len(wb)
+            and all(loose_words_match(x, y) for x, y in zip(wa, wb)))
+
+
 # ------------------------------------------------------------------ registry
 def build_kb_registry(engine: LoreEngine) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Registry of known names from the KB itself:
@@ -122,13 +137,15 @@ def build_kb_registry(engine: LoreEngine) -> Tuple[Dict[str, str], Dict[str, str
                 head = intro_re.split(head)[0].strip(" ,")
             if head:
                 kb_names[head] = doc["key"]
-        for m in re.finditer(r'[\"“«]([^\"”»]{3,30})[\"”»]', first_line):
-            alias = m.group(1).strip()
+        for m in _QUOTED_RE.finditer(first_line):
+            alias = next(g for g in m.groups() if g is not None).strip()
             if not alias or not alias[0].isupper():
                 continue
-            # Skip case-forms of already registered aliases
-            if any(loose_words_match(normalize(alias), normalize(existing))
-                   for existing in kb_aliases):
+            # Skip case-forms of already registered aliases (see
+            # _same_alias_form), but keep distinct multi-word aliases:
+            # «Таверна на Сході» survives next to a registered «Таверна»,
+            # while «Таверни» (a case-form of «Таверна») is still deduped.
+            if any(_same_alias_form(alias, existing) for existing in kb_aliases):
                 continue
             kb_aliases[alias] = doc["key"]
     return kb_names, kb_aliases
@@ -247,12 +264,22 @@ def lint_kb(kb_dir: str, lang: LanguagePack = UK,
                      f"add a document or put the name in the allowlist.")
 
     # 2. Engine self-test ----------------------------------------------------
+    # search_one drops <3-char query words by design, so a name made only
+    # of such words can never resolve — note it as info instead of failing.
     for name, key in kb_names.items():
+        if not engine._query_words(name):
+            rep.info(f"Search self-test skipped for «{name}» — no query "
+                     f"word reaches the 3-char floor.")
+            continue
         found = engine.search_one(name)
         if found is None or found["key"] != key:
             rep.error(f"Search for «{name}» returned "
                       f"{found['key'] if found else 'nothing'} instead of {key}.")
     for alias, key in kb_aliases.items():
+        if not engine._query_words(alias):
+            rep.info(f"Search self-test skipped for alias «{alias}» — no "
+                     f"query word reaches the 3-char floor.")
+            continue
         found = engine.search_one(alias)
         if found is None or found["key"] != key:
             rep.warn(f"Search for alias «{alias}» returned "

@@ -8,6 +8,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from loreengine import LoreEngine, UK, EN, lint_kb, normalize, tokenize, words_match
+from loreengine.lint import build_kb_registry
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXAMPLE_KB = os.path.join(HERE, "..", "examples", "knowledge_base")
@@ -631,6 +632,91 @@ class TestTokenize(unittest.TestCase):
             engine = LoreEngine(tmp, lang=UK, verbose=False)
             doc = engine.search_one("90-тих")
             self.assertTrue(doc and doc["key"] == "era", f"got {doc}")
+
+
+class TestReviewFixesRound2(unittest.TestCase):
+    """Regressions from the second review round (robustness fixes)."""
+
+    def test_non_utf8_page_skipped(self):
+        # One bad-bytes .txt must not crash load() — it is skipped like
+        # any other unreadable file.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "good.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Це хороша сторінка про старий млин.\n")
+            with open(os.path.join(tmp, "lore", "bad.txt"), "wb") as f:
+                f.write(b"\xff\xfe bad bytes \x80\x81 not utf-8\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            self.assertEqual([d["key"] for d in engine.documents], ["good"])
+            doc = engine.search_one("млин")
+            self.assertTrue(doc and doc["key"] == "good", f"got {doc}")
+
+    def test_apostrophe_spellings_agree(self):
+        # U+02BC MODIFIER LETTER APOSTROPHE is a \w char; all three
+        # spellings of «сімʼю» must tokenize identically and match.
+        spellings = ["сімʼю", "сім'ю", "сім’ю"]
+        self.assertEqual(tokenize(" ".join(spellings)), ["сімю"] * 3)
+        self.assertEqual(normalize("сімʼю"), normalize("сім'ю"))
+        for a in spellings:
+            for b in spellings:
+                self.assertTrue(words_match(a, b), f"{a!r} ~ {b!r}")
+
+    def test_apostrophe_spellings_resolve_same_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "family.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Він обійняв свою сімʼю і заплакав.\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            for q in ("сімʼю", "сім'ю", "сім’ю"):
+                doc = engine.search_one(q)
+                self.assertTrue(doc and doc["key"] == "family",
+                                f"q={q!r} got {doc}")
+            docs = engine.pages_for_entities(["сім'ю"])
+            self.assertTrue(docs and docs[0]["key"] == "family")
+
+    def test_max_pages_zero_or_negative_returns_empty(self):
+        engine = LoreEngine(EXAMPLE_KB, lang=EN, verbose=False)
+        self.assertEqual(engine.get_pages(["dragon"], max_pages=0), [])
+        self.assertEqual(engine.get_pages(["dragon"], max_pages=-1), [])
+        self.assertEqual(
+            engine.pages_for_entities(["dragon"], max_pages=0), [])
+        self.assertEqual(
+            engine.pages_for_entities(["dragon"], max_pages=-2), [])
+        # A positive cap still yields exactly that many pages.
+        docs = engine.get_pages(["dragon", "Aldric", "Old Tavern"],
+                                max_pages=2)
+        self.assertEqual(len(docs), 2)
+
+    def test_alias_dedupe_keeps_distinct_multiword(self):
+        # «Таверна на Сході» is NOT a case-form of «Таверна»; «Таверни» is.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "locations"))
+            with open(os.path.join(tmp, "locations", "old_tavern.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Old Tavern («Таверна», «Таверни», "
+                        "«Таверна на Сході») - шумне місце.\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            _names, kb_aliases = build_kb_registry(engine)
+            self.assertIn("Таверна", kb_aliases)
+            self.assertIn("Таверна на Сході", kb_aliases)
+            self.assertNotIn("Таверни", kb_aliases)
+
+    def test_short_name_self_test_is_info_not_error(self):
+        # search_one drops <3-char query words by design, so a canonical
+        # name like "Yo" cannot resolve — the linter notes it, not fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = os.path.join(tmp, "characters")
+            os.makedirs(cat)
+            with open(os.path.join(cat, "yo.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Yo - a man of few letters.\n")
+            report = lint_kb(tmp, lang=EN)
+            self.assertFalse(report.errors, report.errors)
+            self.assertTrue(any("Yo" in i and "skipped" in i
+                                for i in report.infos), report.infos)
+
 
 if __name__ == "__main__":
     unittest.main()

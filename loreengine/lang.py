@@ -132,7 +132,7 @@ EN = LanguagePack(
         "new", "big", "small", "one", "two", "three", "several", "many", "most",
         "some", "almost", "even", "once", "suddenly", "finally", "then", "now",
         "later", "after", "before", "but", "however", "also", "because", "when",
-        "while", "if", "although", "they say", "it is said", "perhaps", "maybe",
+        "while", "if", "although", "perhaps", "maybe",
     }),
     leading_stop=frozenset({
         "for", "although", "today", "even", "suddenly", "finally", "once",
@@ -171,13 +171,13 @@ PL = LanguagePack(
         "kilka", "wiele", "prawie", "właśnie", "nawet", "kiedyś", "wtedy",
         "teraz", "potem", "za", "ze", "z", "od", "na", "w", "do", "po", "przy",
         "ale", "jednak", "także", "dlatego", "żeby", "jak", "nagle", "wreszcie",
-        "w końcu", "ogólnie", "zwykle", "mówią", "podobno", "może", "chyba",
+        "ogólnie", "zwykle", "mówią", "podobno", "może", "chyba",
     }),
     leading_stop=frozenset({
         "dla", "chociaż", "dzisiaj", "właśnie", "nawet", "nagle", "wreszcie",
-        "w końcu", "kiedyś", "wtedy", "teraz", "potem", "ale", "jednak",
+        "kiedyś", "wtedy", "teraz", "potem", "ale", "jednak",
         "także", "dlatego", "żeby", "mówią", "podobno", "może", "chyba",
-        "na pewno", "raczej", "głównie", "często", "czasem", "zawsze",
+        "raczej", "głównie", "często", "czasem", "zawsze",
     }),
     alias_intro_regex=r"\bznany jako\b|\bzwany\b",
 )

@@ -58,7 +58,7 @@ needs it.
 
 | | LoreEngine | Typical RAG |
 |---|---|---|
-| Retrieval | Inverted index + TF-IDF + co-occurrence | Vector similarity |
+| Retrieval | Inverted index + BM25 + co-occurrence | Vector similarity |
 | Determinism | Exact, reproducible | Approximate, can vary |
 | Dependencies | None (stdlib) | Embedding model + vector store |
 | Latency (20k pages) | 0.4 ms lookup / ~15 ms semantic | Embedding + ANN search |
@@ -83,7 +83,9 @@ game needs guarantees, not vibes.
 
 ## Search machinery
 
-- **TF-IDF weighting** — rare words matter more than common ones;
+- **BM25 ranking with exact-vs-fuzzy weighting** — rare words matter more than
+  common ones, document length and term frequency saturate cleanly, and exact
+  matches outrank fuzzy prefix hits;
 - **Transliteration bridge** — file keys are latin (`dark_knight.txt`),
   player queries can be Cyrillic («Дарк Найт»); language packs map between
   alphabets;
@@ -95,7 +97,7 @@ game needs guarantees, not vibes.
   together instead, so `90-ті` stays searchable as `90ті` (and reaches a
   latin key like `lyhi_90ti` through the transliteration bridge);
 - **Inverted prefix index** — queries narrow to candidate pages via a
-  3-char prefix index before the precise TF-IDF ranker runs. Results are
+  3-char prefix index before the precise BM25 ranker runs. Results are
   identical to a full scan (the index is a guaranteed superset, verified by
   a differential test), and entity-name lookups stay fast as the KB grows
   (~5x on 600 pages, ~9x on 2k; no regression when fuzzy matching
@@ -253,7 +255,7 @@ wiki you can lint and query right away.
 ## Development
 
 ```bash
-# Tests (59 tests: search, semantics, scale, linter, review regressions)
+# Tests (105 tests: search, semantics, scale, linter, CLI, regressions)
 python -m unittest discover -s tests -v
 
 # Type checking (strict; the package ships py.typed)

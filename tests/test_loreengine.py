@@ -1369,5 +1369,268 @@ class TestCommit4ApiErgonomics(unittest.TestCase):
             self.assertIn("- pair (2 pages): first, second", summary)
 
 
+class TestCLI(unittest.TestCase):
+    """Tests for python -m loreengine CLI (loreengine/__main__.py)."""
+
+    def test_cli_example_kb_returns_zero(self):
+        import contextlib
+        import io
+        from loreengine.__main__ import main
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main([EXAMPLE_KB, "--lang", "en"])
+        self.assertEqual(rc, 0)
+        self.assertIn("Summary: 0 errors, 0 warnings", buf.getvalue())
+
+    def test_cli_strict_treats_warnings_as_errors(self):
+        import contextlib
+        import io
+        from loreengine.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "BadName.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Bad Name - non-snake-case filename.\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_normal = main([tmp, "--lang", "en"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_strict = main([tmp, "--lang", "en", "--strict"])
+        self.assertEqual(rc_normal, 0)
+        self.assertEqual(rc_strict, 1)
+
+    def test_cli_allowlist_suppresses_warning(self):
+        import contextlib
+        import io
+        from loreengine.__main__ import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "tale.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Old Tale - riders met Ser Bob on the road.\n")
+            allowlist = os.path.join(tmp, ".lint_allowlist.txt")
+            with open(allowlist, "w", encoding="utf-8") as f:
+                f.write("Ser Bob\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_without = main([tmp, "--lang", "en", "--strict"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc_with = main([tmp, "--lang", "en", "--strict",
+                                "--allowlist", allowlist])
+        self.assertEqual(rc_without, 1)
+        self.assertEqual(rc_with, 0)
+
+    def test_cli_missing_kb_returns_one(self):
+        import contextlib
+        import io
+        from loreengine.__main__ import main
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(["/nonexistent/kb/path", "--lang", "en"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[ERROR]", buf.getvalue())
+
+
+class TestPolishAndCustomLang(unittest.TestCase):
+    """Tests for Polish (PL) pack and custom LanguagePack integration."""
+
+    def test_packs_registry_contains_pl(self):
+        from loreengine import PACKS, PL
+
+        self.assertIs(PACKS["pl"], PL)
+        self.assertIs(PACKS["en"], EN)
+        self.assertIs(PACKS["uk"], UK)
+
+    def test_polish_lint_headers_and_alias_intro(self):
+        from loreengine import PL
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "characters", "wiedzmin.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Aliasy: Biały Wilk\n"
+                        "Tagi: łowca, miecz\n"
+                        "Geralt z Rivii znany jako Biały Wilk — zabójca potworów.\n")
+            with open(os.path.join(tmp, "characters", "informator.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Aliasy: Cień\n"
+                        "Jan Kowalski zwany Cieniem — miejski informator.\n")
+            with open(os.path.join(tmp, "lore", "kronika.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Kronika.\nWspomniano tu Geralt z Rivii oraz Biały Wilk.\n")
+
+            engine = LoreEngine(tmp, lang=PL, verbose=False)
+            kb_names, kb_aliases = build_kb_registry(engine)
+            self.assertEqual(kb_names.get("Geralt z Rivii"), "wiedzmin")
+            self.assertEqual(kb_names.get("Jan Kowalski"), "informator")
+            self.assertEqual(kb_aliases.get("Biały Wilk"), "wiedzmin")
+
+            report = lint_kb(tmp, lang=PL)
+            self.assertEqual(report.errors, [], report.errors)
+            self.assertEqual(report.warnings, [], report.warnings)
+
+    def test_custom_language_pack_in_engine_and_lint(self):
+        from loreengine import LanguagePack
+
+        de_pack = LanguagePack(
+            stopwords=frozenset({"der", "die", "das", "ein", "eine"}),
+            translit={"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "characters", "jaeger.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Hans Jäger - ein Waldläufer aus dem Norden.\n")
+            with open(os.path.join(tmp, "lore", "wald.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Nordwald.\nHier traf man oft Hans Jäger.\n")
+
+            engine = LoreEngine(tmp, lang=de_pack, verbose=False)
+            self.assertEqual(engine.search_one("jaeger")["key"], "jaeger")
+            self.assertEqual(engine.search_one("jäger")["key"], "jaeger")
+
+            report = lint_kb(tmp, lang=de_pack)
+            self.assertEqual(report.errors, [], report.errors)
+            self.assertEqual(report.warnings, [], report.warnings)
+
+
+class TestLintCoverage(unittest.TestCase):
+    """Tests for remaining loreengine.lint branches and Report formatting."""
+
+    def test_alias_intro_regex_en_and_uk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            with open(os.path.join(tmp, "characters", "aldric.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Ser Aldric Vane known as Shadow - a mercenary.\n")
+            with open(os.path.join(tmp, "characters", "maren.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Maren Voss better known as Fox - a smuggler.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            kb_names, _ = build_kb_registry(engine)
+            self.assertEqual(kb_names.get("Ser Aldric Vane"), "aldric")
+            self.assertEqual(kb_names.get("Maren Voss"), "maren")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            with open(os.path.join(tmp, "characters", "taras.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Тарас Бульба відомий як Полковник — козак.\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            kb_names, _ = build_kb_registry(engine)
+            self.assertEqual(kb_names.get("Тарас Бульба"), "taras")
+
+    def test_strip_leading_stop_is_noise_and_is_self_reference(self):
+        from loreengine.lint import is_noise, is_self_reference, strip_leading_stop
+
+        # strip_leading_stop: multiple stops stripped; single word preserved
+        self.assertEqual(strip_leading_stop("Today Even Old Tavern", EN), "Old Tavern")
+        self.assertEqual(strip_leading_stop("Today", EN), "Today")
+        self.assertEqual(strip_leading_stop("Для Тараса", UK), "Тараса")
+
+        # is_noise: empty name_words, all sentence_starters, real name
+        self.assertTrue(is_noise("A B", EN))
+        self.assertTrue(is_noise("Old City", EN))
+        self.assertTrue(is_noise("Він Раптом", UK))
+        self.assertFalse(is_noise("Ser Aldric", EN))
+
+        # is_self_reference: empty name_words returns True; title hit vs miss
+        doc = {
+            "key": "old_tavern",
+            "category": "locations",
+            "name": "old tavern",
+            "content": "Old Tavern - a cozy inn.\n",
+            "aliases": [],
+            "tags": [],
+        }
+        self.assertTrue(is_self_reference(doc, "a b"))
+        self.assertTrue(is_self_reference(doc, "Old Tavern"))
+        self.assertFalse(is_self_reference(doc, "Silver Spire"))
+
+    def test_duplicate_key_across_categories_is_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for cat, body in (("characters", "Shadow Character - an assassin.\n"),
+                              ("locations", "Shadow Location - a dark alley.\n")):
+                os.makedirs(os.path.join(tmp, cat))
+                with open(os.path.join(tmp, cat, "shadow.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(body)
+            report = lint_kb(tmp, lang=EN)
+            self.assertTrue(
+                any("Duplicate key 'shadow'" in e for e in report.errors),
+                report.errors,
+            )
+
+    def test_non_snake_case_filename_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "BadName.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Bad Name - CamelCase filename.\n")
+            report = lint_kb(tmp, lang=EN)
+            self.assertTrue(
+                any("BadName" in w and "not latin snake_case" in w
+                    for w in report.warnings),
+                report.warnings,
+            )
+
+    def test_index_warn_and_fail_thresholds(self):
+        from loreengine.lint import INDEX_FAIL_CHARS, INDEX_WARN_CHARS
+
+        self.assertLess(INDEX_WARN_CHARS, INDEX_FAIL_CHARS)
+        rep_warn = lint_kb(EXAMPLE_KB, lang=EN,
+                           index_warn_chars=10, index_fail_chars=100000)
+        self.assertEqual(rep_warn.errors, [], rep_warn.errors)
+        self.assertTrue(
+            any("approaching the cacheable limit" in w for w in rep_warn.warnings),
+            rep_warn.warnings,
+        )
+
+        rep_fail = lint_kb(EXAMPLE_KB, lang=EN,
+                           index_warn_chars=5, index_fail_chars=10)
+        self.assertTrue(
+            any("split it into per-category indexes" in e for e in rep_fail.errors),
+            rep_fail.errors,
+        )
+
+    def test_report_print_and_repr(self):
+        import contextlib
+        import io
+        from loreengine import Report
+
+        rep = Report()
+        rep.info("all good")
+        rep.warn("check this")
+        rep.error("broken ref")
+        self.assertEqual(repr(rep), "Report(errors=1, warnings=1, infos=1)")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rep.print()
+        out = buf.getvalue()
+        self.assertIn("[info] all good", out)
+        self.assertIn("[WARN] check this", out)
+        self.assertIn("[ERROR] broken ref", out)
+        self.assertIn("Summary: 1 errors, 1 warnings, 1 infos.", out)
+
+    def test_empty_and_missing_kb_lint_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rep_empty = lint_kb(tmp, lang=EN)
+            self.assertTrue(
+                any("is empty" in e for e in rep_empty.errors),
+                rep_empty.errors,
+            )
+
+        rep_missing = lint_kb("/nonexistent/kb/path", lang=EN)
+        self.assertTrue(
+            any("is empty" in e for e in rep_missing.errors),
+            rep_missing.errors,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

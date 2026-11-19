@@ -16,10 +16,23 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Games/Entertainment :: Role-Playing",
 ]
 # No runtime dependencies — pure stdlib by design.
 dependencies = []
+
+[project.optional-dependencies]
+dev = ["mypy>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/thecapibara/LoreEngine"
+Repository = "https://github.com/thecapibara/LoreEngine"
+Issues = "https://github.com/thecapibara/LoreEngine/issues"
 
 [project.scripts]
 loreengine-lint = "loreengine.__main__:main"

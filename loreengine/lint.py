@@ -29,7 +29,7 @@ import os
 import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from .engine import LoreDocument, LoreEngine, normalize
+from .engine import LoreDocument, LoreEngine, PathLikeStr, normalize
 from .lang import LanguagePack, UK
 
 # Index size guard (characters). ~6k chars ≈ 2k tokens — still cheap to
@@ -172,12 +172,15 @@ def build_kb_registry(engine: LoreEngine) -> Tuple[Dict[str, str], Dict[str, str
     return kb_names, kb_aliases
 
 
-def load_allowlist(path: Optional[str]) -> Set[str]:
+def load_allowlist(path: Optional[PathLikeStr]) -> Set[str]:
     """Names the project explicitly allows to have no page (# comments ok)."""
-    if not path or not os.path.isfile(path):
+    if not path:
+        return set()
+    path_str = os.fspath(path)
+    if not os.path.isfile(path_str):
         return set()
     names = set()
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path_str, "r", encoding="utf-8") as f:
         for line in f:
             line = line.split("#", 1)[0].strip()
             if line:
@@ -235,9 +238,9 @@ def is_self_reference(doc: LoreDocument, name: str) -> bool:
 
 
 # --------------------------------------------------------------------- lint
-def lint_kb(kb_dir: str, lang: LanguagePack = UK,
+def lint_kb(kb_dir: PathLikeStr, lang: LanguagePack = UK,
             extra_names: Iterable[str] = (),
-            allowlist_path: Optional[str] = None,
+            allowlist_path: Optional[PathLikeStr] = None,
             index_warn_chars: int = INDEX_WARN_CHARS,
             index_fail_chars: int = INDEX_FAIL_CHARS,
             doc_warn_chars: int = DOC_WARN_CHARS) -> Report:
@@ -249,14 +252,15 @@ def lint_kb(kb_dir: str, lang: LanguagePack = UK,
         story cast). Mentions hitting them are reported as INFO, not WARN.
     :param allowlist_path: optional ``.lint_allowlist.txt``.
     """
+    kb_dir_str = os.fspath(kb_dir)
     rep = Report()
-    engine = LoreEngine(kb_dir, lang=lang, verbose=False)
+    engine = LoreEngine(kb_dir_str, lang=lang, verbose=False)
     if not engine.documents:
-        rep.error(f"Knowledge base '{kb_dir}' is empty — nothing to lint.")
+        rep.error(f"Knowledge base '{kb_dir_str}' is empty — nothing to lint.")
         return rep
 
     kb_names, kb_aliases = build_kb_registry(engine)
-    allowlist = load_allowlist(allowlist_path)
+    allowlist = load_allowlist(os.fspath(allowlist_path) if allowlist_path is not None else None)
     extra = {n.strip() for n in (extra_names or ()) if n and n.strip()}
     known_all = list(kb_names) + list(kb_aliases) + list(allowlist)
 

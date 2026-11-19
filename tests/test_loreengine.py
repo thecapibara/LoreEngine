@@ -403,8 +403,8 @@ class TestScale(unittest.TestCase):
         engine = LoreEngine(EXAMPLE_KB, lang=EN, verbose=False)
         summary = engine.category_summary()
         self.assertIn("characters (2 pages)", summary)
-        self.assertIn("locations (1 pages)", summary)
-        self.assertIn("lore (1 pages)", summary)
+        self.assertIn("locations (1 page)", summary)
+        self.assertIn("lore (1 page)", summary)
         self.assertIn("dark_knight", summary)
 
     def test_category_summary_cached(self):
@@ -1239,6 +1239,134 @@ class TestCommit3LintAndLangFixes(unittest.TestCase):
                 any("Northern Kingdom" in w for w in report.warnings),
                 report.warnings,
             )
+
+
+class TestCommit4ApiErgonomics(unittest.TestCase):
+    """Tests for logging, os.PathLike support, and category_summary singularization."""
+
+    def test_verbose_true_uses_logging_and_not_stdout(self):
+        import contextlib
+        import io
+        import logging
+        from unittest import mock
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertLogs("loreengine", level="INFO") as cm:
+                LoreEngine(EXAMPLE_KB, lang=EN, verbose=True)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertTrue(
+            any(r.levelno == logging.INFO and "Documents loaded: 4" in r.getMessage()
+                for r in cm.records),
+            cm.output,
+        )
+
+        # Missing dir and unreadable / listdir errors emit WARNING records, still silent on stdout.
+        buf_warn = io.StringIO()
+        with contextlib.redirect_stdout(buf_warn):
+            with self.assertLogs("loreengine", level="WARNING") as cm_missing:
+                LoreEngine("/nonexistent/kb/path", lang=EN, verbose=True)
+        self.assertEqual(buf_warn.getvalue(), "")
+        self.assertTrue(
+            any(r.levelno == logging.WARNING and "not found" in r.getMessage()
+                for r in cm_missing.records),
+            cm_missing.output,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = os.path.join(tmp, "lore")
+            os.makedirs(cat)
+            bad_file = os.path.join(cat, "bad.txt")
+            with open(bad_file, "wb") as f:
+                f.write(b"\xff\xfe\x00invalid")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertLogs("loreengine", level="WARNING") as cm_read:
+                    LoreEngine(tmp, lang=EN, verbose=True)
+            self.assertTrue(
+                any(r.levelno == logging.WARNING and "Could not read bad.txt" in r.getMessage()
+                    for r in cm_read.records),
+                cm_read.output,
+            )
+
+            with mock.patch("loreengine.engine.os.listdir",
+                            side_effect=PermissionError("denied")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertLogs("loreengine", level="WARNING") as cm_list:
+                        LoreEngine(tmp, lang=EN, verbose=True)
+                self.assertTrue(
+                    any(r.levelno == logging.WARNING and "Could not list" in r.getMessage()
+                        for r in cm_list.records),
+                    cm_list.output,
+                )
+
+    def test_verbose_false_emits_no_log_records(self):
+        import logging
+
+        class _Capture(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def emit(self, record):
+                self.records.append(record)
+
+        lore_logger = logging.getLogger("loreengine")
+        handler = _Capture()
+        old_level = lore_logger.level
+        lore_logger.addHandler(handler)
+        lore_logger.setLevel(logging.DEBUG)
+        try:
+            LoreEngine(EXAMPLE_KB, lang=EN, verbose=False)
+            LoreEngine("/nonexistent/kb/path", lang=EN, verbose=False)
+        finally:
+            lore_logger.removeHandler(handler)
+            lore_logger.setLevel(old_level)
+        self.assertEqual(handler.records, [])
+
+    def test_pathlike_support_across_engine_and_lint(self):
+        from pathlib import Path
+        from loreengine.lint import load_allowlist
+
+        engine = LoreEngine(Path(EXAMPLE_KB), lang=EN, verbose=False)
+        self.assertEqual(engine.kb_dir, os.fspath(Path(EXAMPLE_KB)))
+        self.assertIsInstance(engine.kb_dir, str)
+        self.assertEqual(len(engine.documents), 4)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "characters").mkdir()
+            (tmp_path / "lore").mkdir()
+            (tmp_path / "characters" / "dark_knight.txt").write_text(
+                "Ser Aldric Vane - a wandering mercenary.\n", encoding="utf-8"
+            )
+            (tmp_path / "lore" / "dragon_legend.txt").write_text(
+                "Dragon Legend - riders once met Ser Bob here.\n", encoding="utf-8"
+            )
+            allowlist_file = tmp_path / ".lint_allowlist.txt"
+            allowlist_file.write_text("Ser Bob  # allowed NPC\n", encoding="utf-8")
+
+            loaded = load_allowlist(allowlist_file)
+            self.assertEqual(loaded, {"Ser Bob"})
+
+            report = lint_kb(tmp_path, lang=EN, allowlist_path=allowlist_file)
+            self.assertEqual(report.errors, [], report.errors)
+            self.assertEqual(report.warnings, [], report.warnings)
+
+    def test_category_summary_singular_and_plural(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "solo"))
+            os.makedirs(os.path.join(tmp, "pair"))
+            with open(os.path.join(tmp, "solo", "one.txt"), "w", encoding="utf-8") as f:
+                f.write("Solo page.\n")
+            with open(os.path.join(tmp, "pair", "first.txt"), "w", encoding="utf-8") as f:
+                f.write("First page.\n")
+            with open(os.path.join(tmp, "pair", "second.txt"), "w", encoding="utf-8") as f:
+                f.write("Second page.\n")
+
+            summary = LoreEngine(tmp, lang=EN, verbose=False).category_summary()
+            self.assertIn("- solo (1 page): one", summary)
+            self.assertIn("- pair (2 pages): first, second", summary)
 
 
 if __name__ == "__main__":

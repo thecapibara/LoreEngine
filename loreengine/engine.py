@@ -54,14 +54,18 @@ extension) is the page key. The first line of a page becomes its teaser in
 the index.
 """
 
+import logging
 import math
 import os
 import re
 import unicodedata
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, TypedDict
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
 from .lang import LanguagePack, UK
+
+logger = logging.getLogger("loreengine")
+PathLikeStr = Union[str, "os.PathLike[str]"]
 
 # --- BM25 & exact-vs-fuzzy ranking tuning ---------------------------------
 _BM25_K1 = 1.2
@@ -171,14 +175,14 @@ class LoreEngine:
     :param kb_dir: path to the knowledge base root (category folders inside).
     :param lang: a :class:`loreengine.lang.LanguagePack` (default: Ukrainian).
     :param render_label: header label used by :meth:`render` (default "WIKI").
-    :param verbose: print load diagnostics to stdout. Set ``False`` in
-        libraries/tests to stay silent; a missing folder then just yields an
-        empty engine instead of printing.
+    :param verbose: emit load diagnostics via the ``"loreengine"`` logger.
+        Set ``False`` in libraries/tests to stay silent; a missing folder
+        then just yields an empty engine instead of logging.
     """
 
-    def __init__(self, kb_dir: str = "knowledge_base", lang: LanguagePack = UK,
+    def __init__(self, kb_dir: PathLikeStr = "knowledge_base", lang: LanguagePack = UK,
                  render_label: str = "WIKI", verbose: bool = True):
-        self.kb_dir = kb_dir
+        self.kb_dir: str = os.fspath(kb_dir)
         self.lang = lang
         self.render_label = render_label
         self.verbose = verbose
@@ -204,9 +208,9 @@ class LoreEngine:
         self._full_text_cache: Optional[str] = None
         self.load()
 
-    def _log(self, msg: str) -> None:
+    def _log(self, msg: str, level: int = logging.INFO) -> None:
         if self.verbose:
-            print(msg)
+            logger.log(level, "%s", msg)
 
     def __repr__(self) -> str:
         return f"LoreEngine(kb_dir={self.kb_dir!r}, documents={len(self.documents)})"
@@ -271,12 +275,18 @@ class LoreEngine:
         self._cooc = {}
         self._summary_cache = None
         if not os.path.isdir(self.kb_dir):
-            self._log(f"[LoreEngine] Folder '{self.kb_dir}' not found — lore is empty.")
+            self._log(
+                f"[LoreEngine] Folder '{self.kb_dir}' not found — lore is empty.",
+                logging.WARNING,
+            )
             return
         try:
             categories = sorted(os.listdir(self.kb_dir))
         except OSError as e:
-            self._log(f"[LoreEngine] Could not list '{self.kb_dir}': {e}")
+            self._log(
+                f"[LoreEngine] Could not list '{self.kb_dir}': {e}",
+                logging.WARNING,
+            )
             return
         for category in categories:
             cat_path = os.path.join(self.kb_dir, category)
@@ -285,7 +295,10 @@ class LoreEngine:
             try:
                 filenames = sorted(os.listdir(cat_path))
             except OSError as e:
-                self._log(f"[LoreEngine] Could not list '{cat_path}': {e}")
+                self._log(
+                    f"[LoreEngine] Could not list '{cat_path}': {e}",
+                    logging.WARNING,
+                )
                 continue
             for filename in filenames:
                 if not filename.endswith(".txt"):
@@ -297,7 +310,10 @@ class LoreEngine:
                     with open(filepath, "r", encoding="utf-8-sig") as f:
                         raw = f.read()
                 except (OSError, UnicodeDecodeError) as e:
-                    self._log(f"[LoreEngine] Could not read {filename}: {e}")
+                    self._log(
+                        f"[LoreEngine] Could not read {filename}: {e}",
+                        logging.WARNING,
+                    )
                     continue
                 # Normalize line endings so CRLF files never leak \r into
                 # dosed content, teasers, or linter title parsing.
@@ -307,8 +323,11 @@ class LoreEngine:
                 aliases, tags, content = self._parse_meta(raw)
                 if not content:
                     if aliases or tags:
-                        self._log(f"[LoreEngine] {filename}: header only "
-                                  "(aliases/tags without body) — page skipped.")
+                        self._log(
+                            f"[LoreEngine] {filename}: header only "
+                            "(aliases/tags without body) — page skipped.",
+                            logging.WARNING,
+                        )
                     continue
                 key = os.path.splitext(filename)[0]
                 doc: LoreDocument = {
@@ -385,7 +404,7 @@ class LoreEngine:
                 self._df[w] = self._df.get(w, 0) + 1
         self._build_prefix_index()
         self._build_cooc()
-        self._log(f"[LoreEngine] Documents loaded: {len(self.documents)}")
+        self._log(f"[LoreEngine] Documents loaded: {len(self.documents)}", logging.INFO)
 
     def _build_prefix_index(self) -> None:
         """Inverted index: 3-char word prefix -> doc indices, plus a
@@ -548,8 +567,10 @@ class LoreEngine:
         lines = []
         for cat in sorted(by_cat):
             keys = by_cat[cat]
-            sample = ", ".join(keys[:5]) + ("…" if len(keys) > 5 else "")
-            lines.append(f"- {cat} ({len(keys)} pages): {sample}")
+            count = len(keys)
+            unit = "page" if count == 1 else "pages"
+            sample = ", ".join(keys[:5]) + ("…" if count > 5 else "")
+            lines.append(f"- {cat} ({count} {unit}): {sample}")
         self._summary_cache = "\n".join(lines)
         return self._summary_cache
 

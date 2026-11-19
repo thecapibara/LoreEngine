@@ -907,5 +907,185 @@ class TestCommit1Fixes(unittest.TestCase):
                 self.assertEqual(engine_cat_err.documents, [])
 
 
+class TestCommit2Improvements(unittest.TestCase):
+    """Tests for BM25 ranking, exact-vs-fuzzy weighting, tokenization, body translit, cooc, and memory."""
+
+    def test_bm25_higher_tf_and_shorter_doc_win(self):
+        # Higher TF beats lower TF on equal-length documents.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "alpha_low.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("A chronicle mentioning phoenix once among quiet hills.\n")
+            with open(os.path.join(tmp, "lore", "zeta_high.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("A phoenix rose, the phoenix burned, phoenix reborn again.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            self.assertEqual(engine.search_one("phoenix")["key"], "zeta_high")
+
+        # Shorter focused doc beats long diluted doc with the same TF=1.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "alpha_long.txt"), "w",
+                      encoding="utf-8") as f:
+                filler = " ".join(f"word{i}" for i in range(120))
+                f.write(f"Long archive with phoenix buried inside. {filler}.\n")
+            with open(os.path.join(tmp, "lore", "zeta_short.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Short note on phoenix.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            self.assertEqual(engine.search_one("phoenix")["key"], "zeta_short")
+            # Long doc still passes _min_score() when searched directly via exclude/relevant.
+            rel = engine.relevant("phoenix", k=2)
+            self.assertEqual([d["key"] for d in rel], ["zeta_short", "alpha_long"])
+
+    def test_bm25_long_doc_fuzzy_passes_min_score(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "short.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Short page about ravens.\n")
+            with open(os.path.join(tmp, "lore", "long.txt"), "w",
+                      encoding="utf-8") as f:
+                filler = " ".join(f"filler{i}" for i in range(200))
+                f.write(f"Long page mentioning ravens and baron. {filler}.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            doc = engine.search_one("bar")  # fuzzy "bar" -> "baron" on 200+ word doc
+            self.assertIsNotNone(doc)
+            self.assertEqual(doc["key"], "long")
+
+    def test_exact_match_beats_fuzzy_prefix_on_body_and_key(self):
+        # Body exact vs fuzzy ("bar" vs "baron") — exact "bar" must win even if key is later.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "alpha_fuzzy.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("The baron rules the valley.\n")
+            with open(os.path.join(tmp, "lore", "zeta_exact.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("The bar serves cold ale.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            self.assertEqual(engine.search_one("bar")["key"], "zeta_exact")
+
+        # Key exact vs fuzzy ("bar" vs "baron").
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "baron.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("A noble title.\n")
+            with open(os.path.join(tmp, "lore", "bar.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("A drinking spot.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            self.assertEqual(engine.search_one("bar")["key"], "bar")
+
+    def test_tokenize_normalize_and_words_match(self):
+        self.assertEqual(tokenize("man-at-arms"), ["man", "at", "arms"])
+        self.assertEqual(tokenize("end-to-end"), ["end", "to", "end"])
+        self.assertEqual(tokenize("dark_knight"), ["dark", "knight"])
+        self.assertEqual(tokenize("1.Dragon"), ["1", "dragon"])
+        self.assertEqual(tokenize("90-ті"), ["90ті"])
+        self.assertTrue(words_match("Dragon", "dragon"))
+        self.assertTrue(words_match("DRAGONS", "dragonkin"))
+        self.assertEqual(normalize("O'Brien"), "obrien")
+        self.assertEqual(tokenize("O'Brien"), ["obrien"])
+        self.assertEqual(normalize("O\u2019Brien"), "obrien")
+        self.assertEqual(tokenize("O\u2019Brien"), ["obrien"])
+        self.assertEqual(normalize("сімʼю"), "сімю")
+        self.assertEqual(tokenize("сімʼю"), ["сімю"])
+
+    def test_polish_diacritic_free_body_search(self):
+        from loreengine import PL
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "locations"))
+            with open(os.path.join(tmp, "locations", "miasto.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Wrocław to piękne miasto nad Odrą.\n")
+            with open(os.path.join(tmp, "locations", "zamek.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Stary król mieszkał w zamku. Królowie rządzili mądrze.\n")
+            engine = LoreEngine(tmp, lang=PL, verbose=False)
+            self.assertEqual(engine.search_one("wroclaw")["key"], "miasto")
+            self.assertEqual(engine.search_one("krol")["key"], "zamek")
+            # Fuzzy prefix match over Polish diacritics in body ("krolow" -> "królowie").
+            self.assertEqual(engine.search_one("krolow")["key"], "zamek")
+            # Equivalence against full scan (_pref cleared).
+            engine._pref = {}
+            engine._short_key = {}
+            self.assertEqual(engine.search_one("wroclaw")["key"], "miasto")
+            self.assertEqual(engine.search_one("krol")["key"], "zamek")
+            self.assertEqual(engine.search_one("krolow")["key"], "zamek")
+
+    def test_body_pref_memory_threshold_and_equivalence(self):
+        from loreengine import PL
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "short_doc.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Krótki opis miasta Wrocław i królestwa.\n")
+            many_words = " ".join(f"token{i:03d}" for i in range(80))
+            with open(os.path.join(tmp, "lore", "long_doc.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(f"Wrocław królestwo królowie {many_words}.\n")
+            engine = LoreEngine(tmp, lang=PL, verbose=False)
+            by_key = {d["key"]: i for i, d in enumerate(engine.documents)}
+            short_idx = by_key["short_doc"]
+            long_idx = by_key["long_doc"]
+            self.assertIsNone(engine._body_pref[short_idx])
+            self.assertIsNotNone(engine._body_pref[long_idx])
+            # Score with _body_pref populated must match full-scan (_body_pref=None).
+            for q in ("wroclaw", "krolow", "token042", "krolestw"):
+                words = engine._query_words(q)
+                with_pref = engine._score_doc(long_idx, words)
+                saved = engine._body_pref[long_idx]
+                try:
+                    engine._body_pref[long_idx] = None
+                    without_pref = engine._score_doc(long_idx, words)
+                finally:
+                    engine._body_pref[long_idx] = saved
+                self.assertAlmostEqual(with_pref, without_pref, places=12, msg=f"q={q!r}")
+
+    def test_cooc_proportional_weights_and_tier2_prioritization(self):
+        import loreengine.engine as eng_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            # "hammer" co-occurs with "anvil" in 2 docs (strong), "torch" in 1 doc (mid),
+            # and "candle" in 1 doc while "candle" also appears elsewhere (weakest).
+            with open(os.path.join(tmp, "lore", "p1.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Hammer and anvil.\n")
+            with open(os.path.join(tmp, "lore", "p2.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Hammer, anvil, torch, candle.\n")
+            # Secondary-only docs (no "hammer"). "aaa_weak" only has "candle" (alphabetically first!),
+            # while "zzz_strong" has "anvil".
+            with open(os.path.join(tmp, "lore", "aaa_weak.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("A lone candle flickers.\n")
+            with open(os.path.join(tmp, "lore", "zzz_strong.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("An iron anvil stands here.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            exp_words, exp_weights = engine._expand(["hammer"])
+            wmap = dict(zip(exp_words, exp_weights))
+            self.assertEqual(wmap["hammer"], 1.0)
+            self.assertIn("anvil", wmap)
+            self.assertIn("torch", wmap)
+            self.assertIn("candle", wmap)
+            self.assertGreater(wmap["anvil"], wmap["torch"])
+            self.assertGreater(wmap["torch"], wmap["candle"])
+            self.assertAlmostEqual(wmap["candle"], 0.2, places=6)
+            self.assertAlmostEqual(wmap["anvil"], eng_mod._COOC_WEIGHT, places=6)
+
+            # Force Tier-2 budget = 1 (exclude primary docs p1/p2 -> cap = 1 so only 1 secondary).
+            old_cap = eng_mod._RELEVANT_MAX_CANDIDATES
+            try:
+                eng_mod._RELEVANT_MAX_CANDIDATES = 3  # primary has 2 (p1, p2), leaving budget=1
+                docs = engine.relevant("hammer", k=2, exclude=["p1", "p2"])
+                self.assertEqual([d["key"] for d in docs], ["zzz_strong"])
+            finally:
+                eng_mod._RELEVANT_MAX_CANDIDATES = old_cap
+
+
 if __name__ == "__main__":
     unittest.main()

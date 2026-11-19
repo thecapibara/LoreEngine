@@ -58,9 +58,17 @@ import math
 import os
 import re
 import unicodedata
+from collections import Counter
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, TypedDict
 
 from .lang import LanguagePack, UK
+
+# --- BM25 & exact-vs-fuzzy ranking tuning ---------------------------------
+_BM25_K1 = 1.2
+_BM25_B = 0.75
+_EXACT_WEIGHT = 1.0
+_FUZZY_WEIGHT = 0.7
+_BODY_PREF_THRESHOLD = 64  # only build per-doc prefix buckets for longer docs
 
 # --- co-occurrence (distributional semantics) tuning ----------------------
 # Words that share documents are treated as semantically related. This is
@@ -70,29 +78,32 @@ _COOC_NEIGHBORS = 15   # max semantic neighbors stored per word (memory cap)
 _COOC_PRUNE_KEEP = 4 * _COOC_NEIGHBORS      # running top kept at prune time
 _COOC_PRUNE_TRIGGER = 8 * _COOC_NEIGHBORS  # prune a word's map past this size
 _COOC_EXPAND = 6       # max expansion words added to a relevant() query
-_COOC_WEIGHT = 0.5     # score multiplier for expansion (semantic) words
+_COOC_WEIGHT = 0.5     # max score multiplier for expansion (semantic) words
+_COOC_EXPAND_MIN_WEIGHT = 0.2  # min weight for normalized top expansion words
 _RELEVANT_MAX_CANDIDATES = 1200  # safety cap on candidate set for relevant()
 _NO_APOSTROPHE = str.maketrans("", "", "'\u2019\u02bc")
 
 
 def normalize(s: str) -> str:
-    """Lowercase, replace punctuation with spaces, collapse whitespace (NFC).
+    """Lowercase, strip apostrophes, replace punctuation with spaces, collapse whitespace (NFC).
 
     Punctuation becomes a space (not nothing), so hyphenated names split
-    into searchable words: ``Jean-Luc`` -> ``jean luc``.
+    into searchable words: ``Jean-Luc`` -> ``jean luc``, while apostrophes
+    are stripped consistently with :func:`tokenize`: ``O'Brien`` -> ``obrien``.
     """
     s = unicodedata.normalize("NFC", s or "").lower().strip()
     # U+02BC MODIFIER LETTER APOSTROPHE is a word character («сімʼю» would
-    # stay one token); route it through the same punctuation path as the
-    # plain and curly apostrophes so all three spellings agree.
-    s = s.replace("\u02bc", "'")
+    # stay one token); strip all apostrophe variants consistently with tokenize().
+    s = s.translate(_NO_APOSTROPHE)
     s = re.sub(r"[^\w\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
 def words_match(w1: str, w2: str) -> bool:
-    """Fuzzy word comparison: exact match, a shared prefix (case endings),
-    or a short-word inflection ("ліс" ~ "лісу", "cat" ~ "cats")."""
+    """Case-insensitive fuzzy word comparison: exact match, a shared prefix
+    (case endings), or a short-word inflection ("ліс" ~ "лісу", "cat" ~ "cats")."""
+    w1 = w1.lower()
+    w2 = w2.lower()
     if w1 == w2:
         return True
     # Apostrophes never survive tokenize(), so dropping them here only
@@ -116,23 +127,26 @@ def words_match(w1: str, w2: str) -> bool:
 def tokenize(text: str) -> List[str]:
     """Words for indexing and search.
 
-    Like :func:`normalize`, but when punctuation splits a chunk and ANY
-    fragment is shorter than 3 chars, the fragments are glued back
-    together: ``90-ті`` -> ``90ті``, ``сім'ю`` -> ``сімя``. Short
-    fragments fall below the 3-char search floor and would otherwise
-    vanish from both queries and indexes, losing matches like the query
-    ``90-ті`` against the key ``lyhi_90ti`` (via transliteration).
-    Chunks whose fragments are all long keep the split, so ``Jean-Luc``
-    -> ``jean luc`` and each part stays searchable on its own.
+    Strips apostrophes consistently with :func:`normalize` (``O'Brien`` ->
+    ``["obrien"]``, ``сім'ю`` -> ``["сімю"]``), splits on punctuation and
+    underscores (``dark_knight`` -> ``["dark", "knight"]``), and glues
+    two-part hyphenated tokens when one part is shorter than 3 chars
+    (``90-ті`` -> ``["90ті"]``) while keeping multi-part phrases and
+    non-hyphenated splits separate (``man-at-arms`` -> ``["man", "at",
+    "arms"]``, ``1.Dragon`` -> ``["1", "dragon"]``).
     """
     s = unicodedata.normalize("NFC", text or "").lower()
-    s = s.replace("\u02bc", "'")  # see normalize(): same apostrophe path
+    s = s.translate(_NO_APOSTROPHE)
     words: List[str] = []
     for chunk in s.split():
-        parts = [p for p in re.split(r"[^\w]+", chunk) if p]
+        stripped = re.sub(r"^[\W_]+|[\W_]+$", "", chunk)
+        if not stripped:
+            continue
+        parts = [p for p in re.split(r"[\W_]+", stripped) if p]
         if not parts:
             continue
-        if len(parts) > 1 and any(len(p) < 3 for p in parts):
+        if (len(parts) == 2 and any(len(p) < 3 for p in parts)
+                and re.fullmatch(r"[^\W_]+[-–—][^\W_]+", stripped)):
             words.append("".join(parts))
         else:
             words.extend(parts)
@@ -170,12 +184,16 @@ class LoreEngine:
         self.verbose = verbose
         self.documents: List[LoreDocument] = []
         self._words: List[Set[str]] = []      # body words, parallel to documents
+        self._tf: List[Counter[str]] = []     # per-doc body term frequencies
+        self._doc_len: List[int] = []         # per-doc body token counts
+        self._avgdl: float = 0.0              # average document length (tokens)
         self._key_words: List[Set[str]] = []  # key/name/alias words, parallel
+        self._key_translit: List[Set[str]] = []  # transliterated key words (when != orig)
         self._title_words: List[Set[str]] = []  # first-line "Name - ..." words, parallel
-        # Per-doc 3-char-prefix -> body words. words_match acceptance implies a
-        # shared >=3-char prefix, so scoring against only this bucket (instead
-        # of every body word) is provably identical and sub-linear in doc length.
-        self._body_pref: List[Dict[str, Set[str]]] = []
+        # Per-doc 3-char-prefix -> body words, built only when len(body_words) > 64.
+        # Shorter docs scan body_words directly to save memory with identical results.
+        self._body_pref: List[Optional[Dict[str, Set[str]]]] = []
+        self._body_translit: List[Dict[str, Set[str]]] = []  # translit -> {orig body words}
         self._df: Dict[str, int] = {}         # word -> document frequency (IDF)
         self._pref: Dict[str, Set[int]] = {}  # 3-char prefix -> doc indices
         self._short_key: Dict[str, Set[int]] = {}  # <3-char word -> doc indices
@@ -236,9 +254,14 @@ class LoreEngine:
         """
         self.documents = []
         self._words = []
+        self._tf = []
+        self._doc_len = []
+        self._avgdl = 0.0
         self._key_words = []
+        self._key_translit = []
         self._title_words = []
         self._body_pref = []
+        self._body_translit = []
         self._df = {}
         self._pref = {}
         self._short_key = {}
@@ -305,22 +328,60 @@ class LoreEngine:
                 # (e.g. Tags: beer, drinks on a tavern page) — index them.
                 for tag in tags:
                     key_words |= set(tokenize(tag))
-                body_words = set(tokenize(content))
+                body_tokens = tokenize(content)
+                tf = Counter(body_tokens)
+                body_words = set(tf)
+                self._tf.append(tf)
+                self._doc_len.append(len(body_tokens))
                 self._words.append(body_words)
-                bp: Dict[str, Set[str]] = {}
-                for bw in body_words:
-                    if len(bw) >= 3:
-                        bp.setdefault(bw[:3], set()).add(bw)
-                self._body_pref.append(bp)
+                body_translit: Dict[str, Set[str]] = {}
+                if self.lang.translit:
+                    for bw in body_words:
+                        tbw = self._translit(bw)
+                        if tbw and tbw != bw:
+                            body_translit.setdefault(tbw, set()).add(bw)
+                self._body_translit.append(body_translit)
+                if len(body_words) > _BODY_PREF_THRESHOLD:
+                    bp: Dict[str, Set[str]] = {}
+                    for bw in body_words:
+                        if len(bw) >= 3:
+                            bp.setdefault(bw[:3], set()).add(bw)
+                        if self.lang.translit:
+                            tbw = self._translit(bw)
+                            if tbw != bw and len(tbw) >= 3:
+                                bp.setdefault(tbw[:3], set()).add(bw)
+                    self._body_pref.append(bp)
+                else:
+                    self._body_pref.append(None)
                 self._key_words.append(key_words)
+                if self.lang.translit:
+                    kt = {
+                        tkw for kw in key_words
+                        for tkw in (self._translit(kw),)
+                        if tkw and tkw != kw
+                    }
+                else:
+                    kt = set()
+                self._key_translit.append(kt)
                 first_line = content.split("\n", 1)[0]
                 title_parts = re.split(r"\s+[-—–]\s+", first_line, maxsplit=1)
                 self._title_words.append(
                     set(tokenize(title_parts[0])) if len(title_parts) > 1 else set()
                 )
-        # Document frequency (content words + latin keys + aliases + tags)
+        self._avgdl = (
+            sum(self._doc_len) / len(self._doc_len) if self._doc_len else 0.0
+        )
+        # Document frequency (content words + latin keys + aliases + tags + translit forms)
         for i in range(len(self.documents)):
-            for w in self._words[i] | self._key_words[i]:
+            doc_words = self._words[i] | self._key_words[i]
+            if self.lang.translit:
+                translit_forms = {
+                    tw for w in doc_words
+                    for tw in (self._translit(w),)
+                    if tw and tw != w and tw not in doc_words
+                }
+                doc_words = doc_words | translit_forms
+            for w in doc_words:
                 self._df[w] = self._df.get(w, 0) + 1
         self._build_prefix_index()
         self._build_cooc()
@@ -332,13 +393,14 @@ class LoreEngine:
 
         Every :func:`words_match` acceptance (exact match, shared 5-char
         prefix, short-word inflection with a >=3-char stem) implies a shared
-        3-char prefix, so the prefix index is a guaranteed SUPERSET of
-        everything the precise ``_score_doc`` ranker may accept — narrowing
-        to it never loses results. Words shorter than 3 chars can only ever
-        match exactly, so they are indexed verbatim in ``_short_key`` and a
-        degenerate short transliteration still narrows instead of forcing a
-        full scan. Built eagerly at load: read-heavy workload, no cold-start
-        latency in the game loop.
+        3-char prefix (for both raw words and their transliterated forms), so
+        the prefix index is a guaranteed SUPERSET of everything the precise
+        ``_score_doc`` ranker may accept — narrowing to it never loses
+        results. Words shorter than 3 chars can only ever match exactly, so
+        they are indexed verbatim in ``_short_key`` and a degenerate short
+        transliteration still narrows instead of forcing a full scan. Built
+        eagerly at load: read-heavy workload, no cold-start latency in the
+        game loop.
         """
         self._pref = {}
         self._short_key = {}
@@ -348,6 +410,22 @@ class LoreEngine:
                     self._pref.setdefault(w[:3], set()).add(i)
                 else:
                     self._short_key.setdefault(w, set()).add(i)
+                if self.lang.translit:
+                    tw = self._translit(w)
+                    if tw and tw != w:
+                        if len(tw) >= 3:
+                            self._pref.setdefault(tw[:3], set()).add(i)
+                        else:
+                            self._short_key.setdefault(tw, set()).add(i)
+
+    def _cooc_weight(self, a: str, b: str, count: int) -> float:
+        """Normalized co-occurrence strength (cosine * min-IDF * repeat bonus)."""
+        df_a = max(1, self._df.get(a, 1))
+        df_b = max(1, self._df.get(b, 1))
+        cosine = count / math.sqrt(df_a * df_b)
+        idf_min = min(self._idf(a), self._idf(b))
+        repeat_bonus = 1.5 if count >= 2 else 1.0
+        return cosine * idf_min * repeat_bonus
 
     def _build_cooc(self) -> None:
         """Co-occurrence index: word -> {neighbor: weight}.
@@ -358,14 +436,16 @@ class LoreEngine:
         that never uses those words but shares their context. Powers the
         semantic expansion in :meth:`relevant`.
 
+        Pair counts are normalized by ``count / sqrt(df[a] * df[b]) * min(IDF)``
+        with a bonus for repeated co-occurrences (``count >= 2``), so common
+        generic words do not dominate and repeated edges outrank one-off
+        coincidences while still preserving 1-doc semantic bridges.
+
         Memory is bounded for giant corpora: each word's neighbor map is
         pruned to a deterministic top-``_COOC_PRUNE_KEEP`` whenever it grows
         past ``_COOC_PRUNE_TRIGGER``, then to ``_COOC_NEIGHBORS`` at the end.
-        Weights only increase during construction, so a neighbor that is not
-        in the running top at prune time is very unlikely to become the final
-        top-``_COOC_NEIGHBORS`` — the approximation is negligible in practice.
         """
-        counts: Dict[str, Dict[str, float]] = {}
+        pair_counts: Dict[str, Dict[str, int]] = {}
         for i in range(len(self.documents)):
             # Keep the most discriminative words (highest IDF) — rare words
             # carry the semantic signal; alphabetical truncation would drop
@@ -373,25 +453,32 @@ class LoreEngine:
             ws = sorted((w for w in self._words[i]
                          if len(w) >= 3 and w not in self.lang.stopwords),
                         key=lambda w: (-self._idf(w), w))[:_COOC_MAX_WORDS]
-            idfs = [self._idf(w) for w in ws]
             for a in range(len(ws)):
+                wa = ws[a]
                 for b in range(a + 1, len(ws)):
-                    # Weight by the rarer word so common context doesn't dominate.
-                    wgt = min(idfs[a], idfs[b])
-                    wa, wb = ws[a], ws[b]
+                    wb = ws[b]
                     for x, y in ((wa, wb), (wb, wa)):
-                        nbs = counts.setdefault(x, {})
-                        nbs[y] = nbs.get(y, 0.0) + wgt
+                        nbs = pair_counts.setdefault(x, {})
+                        nbs[y] = nbs.get(y, 0) + 1
                         if len(nbs) > _COOC_PRUNE_TRIGGER:
-                            top = sorted(nbs.items(),
-                                         key=lambda kv: (-kv[1], kv[0]))[:_COOC_PRUNE_KEEP]
-                            # Prune in place (nbs is counts[x]) so no stale
+                            top = sorted(
+                                nbs.items(),
+                                key=lambda kv: (
+                                    -self._cooc_weight(x, kv[0], kv[1]),
+                                    kv[0],
+                                ),
+                            )[:_COOC_PRUNE_KEEP]
+                            # Prune in place (nbs is pair_counts[x]) so no stale
                             # reference to the discarded map survives.
                             nbs.clear()
                             nbs.update(top)
         self._cooc = {}
-        for w, nbs in counts.items():
-            top = sorted(nbs.items(), key=lambda kv: (-kv[1], kv[0]))[:_COOC_NEIGHBORS]
+        for w, nbs in pair_counts.items():
+            scored = [
+                (nb, self._cooc_weight(w, nb, cnt))
+                for nb, cnt in nbs.items()
+            ]
+            top = sorted(scored, key=lambda kv: (-kv[1], kv[0]))[:_COOC_NEIGHBORS]
             self._cooc[w] = dict(top)
 
     @staticmethod
@@ -478,14 +565,15 @@ class LoreEngine:
 
     def _expand(self, words: List[str]) -> Tuple[List[str], List[float]]:
         """Expand query words with semantic neighbors from the co-occurrence
-        space. Returns ``(words, weights)``: originals weight 1.0, expansion
-        words ``_COOC_WEIGHT``. Deterministic; no-op when the co-occurrence
-        index is empty.
+        space. Returns ``(words, weights)``: originals weight 1.0, and top
+        expansion neighbors normalized into ``[_COOC_EXPAND_MIN_WEIGHT, _COOC_WEIGHT]``
+        proportional to their co-occurrence strength. Deterministic; no-op when
+        the co-occurrence index is empty.
 
         Common words are already excluded: the co-occurrence index weights
-        pairs by min-IDF and prunes to the top neighbors per word, and IDF
-        down-weights common words at scoring time. The candidate cap in
-        :meth:`relevant` bounds latency on large corpora.
+        pairs by normalized cosine * min-IDF and prunes to the top neighbors per
+        word, and IDF down-weights common words at scoring time. The candidate
+        cap in :meth:`relevant` bounds latency on large corpora.
         """
         if not self._cooc:
             return list(words), [1.0] * len(words)
@@ -496,39 +584,67 @@ class LoreEngine:
                 if nb not in wordset:
                     extra[nb] = max(extra.get(nb, 0.0), wt)
         top = sorted(extra.items(), key=lambda kv: (-kv[1], kv[0]))[:_COOC_EXPAND]
+        if not top:
+            return list(words), [1.0] * len(words)
+        max_wt = top[0][1]
+        min_wt = top[-1][1]
+        span = max_wt - min_wt
+        exp_weights: List[float] = []
+        for _, wt in top:
+            if span <= 0.0:
+                exp_weights.append(_COOC_WEIGHT)
+            else:
+                norm = (wt - min_wt) / span
+                exp_weights.append(
+                    _COOC_EXPAND_MIN_WEIGHT + (_COOC_WEIGHT - _COOC_EXPAND_MIN_WEIGHT) * norm
+                )
         out_words = list(words) + [w for w, _ in top]
-        out_weights = [1.0] * len(words) + [_COOC_WEIGHT] * len(top)
+        out_weights = [1.0] * len(words) + exp_weights
         return out_words, out_weights
 
     def _word_matches_set(self, w: str, words: Set[str]) -> bool:
-        """True if query word ``w`` (or its transliteration) matches ``words``."""
+        """True if query word ``w`` (or its transliteration) matches ``words`` (raw or transliterated)."""
         tw = self._translit(w)
         if tw in words or w in words:
             return True
-        return any(words_match(tw, kw) or words_match(w, kw) for kw in words)
+        if any(words_match(tw, kw) or words_match(w, kw) for kw in words):
+            return True
+        if self.lang.translit:
+            for kw in words:
+                tkw = self._translit(kw)
+                if tkw != kw and (
+                    tkw == w or tkw == tw
+                    or words_match(w, tkw) or words_match(tw, tkw)
+                ):
+                    return True
+        return False
 
     def _score_doc(self, i: int, words: List[str],
                    weights: Optional[List[float]] = None,
                    *, entity_only: bool = False) -> float:
-        """Score document #i against query words (TF-IDF + translit + prefixes).
+        """Score document #i against query words (BM25 + exact-vs-fuzzy + translit).
 
         ``weights`` (parallel to ``words``) discounts semantic expansion words.
+        Exact hits score ``1.0x`` and fuzzy ``words_match`` hits score ``0.7x``
+        on both ``key_words`` and ``body_words``. Body hits use BM25 TF scaling
+        (``k1=1.2, b=0.75``) over document token counts and lengths.
         When ``entity_only=True`` (scene entity dosing), only ``key_words``
         (key, name, aliases, tags) are scored — body text alone never produces
         a match, and multi-word queries require more than half of their words
         to match ``key_words`` (or all words to match ``key_words`` plus the
         page's ``Name - ...`` first-line title with at least one key hit).
-        Exact set membership is checked before the fuzzy loop as a fast path
-        (exact match is a subset of :func:`words_match`, so results are
-        identical). Fuzzy body matching is restricted to the document's
-        3-char-prefix bucket — every :func:`words_match` acceptance shares a
-        >=3-char prefix, so this is provably identical to scanning every body
-        word while being sub-linear in document length.
         """
         score = 0.0
         key_words = self._key_words[i]
+        key_translit = self._key_translit[i]
         body_words = self._words[i]
         body_pref = self._body_pref[i]
+        body_translit = self._body_translit[i]
+        doc_tf = self._tf[i]
+        dl = self._doc_len[i]
+        avgdl = self._avgdl or 1.0
+        len_norm = 1.0 - _BM25_B + _BM25_B * (dl / avgdl)
+        has_translit = bool(self.lang.translit)
         key_hits = 0
         for idx, w in enumerate(words):
             mult = weights[idx] if weights else 1.0
@@ -541,27 +657,57 @@ class LoreEngine:
                 # spelling (df=0).
                 idf = self._idf(tw)
             # Hit on the document key/name/aliases/tags (latin via translit, or native)
-            if tw in key_words or w in key_words:
-                score += mult * (3.0 * idf + 2.0)
+            exact_key = (
+                tw in key_words or w in key_words
+                or w in key_translit or (tw != w and tw in key_translit)
+            )
+            if exact_key:
+                score += mult * _EXACT_WEIGHT * (3.0 * idf + 2.0)
                 key_hits += 1
-            elif any(words_match(tw, kw) or words_match(w, kw) for kw in key_words):
-                score += mult * (3.0 * idf + 2.0)
+            elif (any(words_match(tw, kw) or words_match(w, kw) for kw in key_words)
+                  or (key_translit and any(
+                      words_match(tw, tkw) or words_match(w, tkw)
+                      for tkw in key_translit))):
+                score += mult * _FUZZY_WEIGHT * (3.0 * idf + 2.0)
                 key_hits += 1
             elif not entity_only:
-                # Hit on a word in the body (fuzzy — handles case endings)
-                hit = w in body_words
-                if not hit:
-                    bucket = body_pref.get(w[:3])  # query/cooc words are always >=3 chars
-                    hit = bool(bucket and any(words_match(w, cw) for cw in bucket))
-                if hit:
-                    # Slight boost when the matched word is in the page's
-                    # "Name - ..." first-line title, so a page about X outranks
-                    # a page that merely mentions X in its body.
+                # Hit on body words: exact (incl. translit equivalence) beats fuzzy.
+                exact_tf = doc_tf.get(w, 0)
+                if tw != w:
+                    exact_tf += doc_tf.get(tw, 0)
+                if body_translit:
+                    for orig in body_translit.get(w, ()):
+                        if orig != w and orig != tw:
+                            exact_tf += doc_tf.get(orig, 0)
+                    if tw != w:
+                        for orig in body_translit.get(tw, ()):
+                            if orig != w and orig != tw:
+                                exact_tf += doc_tf.get(orig, 0)
+                if exact_tf > 0:
+                    tf = exact_tf
+                    exact_mult = _EXACT_WEIGHT
+                else:
+                    tf = 0
+                    if body_pref is not None:
+                        cand_bw = set(body_pref.get(w[:3], ()))
+                        if tw != w and len(tw) >= 3:
+                            cand_bw |= body_pref.get(tw[:3], set())
+                    else:
+                        cand_bw = body_words
+                    for cw in cand_bw:
+                        matched = words_match(w, cw) or (tw != w and words_match(tw, cw))
+                        if not matched and has_translit:
+                            tcw = self._translit(cw)
+                            if tcw != cw:
+                                matched = words_match(w, tcw) or (tw != w and words_match(tw, tcw))
+                        if matched:
+                            tf += doc_tf[cw]
+                    exact_mult = _FUZZY_WEIGHT
+                if tf > 0:
+                    tf_norm = (tf * (_BM25_K1 + 1.0)) / (tf + _BM25_K1 * len_norm)
                     title_words = self._title_words[i]
-                    in_title = w in title_words or any(
-                        words_match(w, tw_) for tw_ in title_words
-                    )
-                    score += mult * ((1.5 if in_title else 1.0) * idf)
+                    in_title = self._word_matches_set(w, title_words)
+                    score += mult * exact_mult * (1.5 if in_title else 1.0) * tf_norm * idf
         if entity_only:
             if not key_hits:
                 return 0.0
@@ -605,13 +751,13 @@ class LoreEngine:
     def _min_score(self) -> float:
         """Acceptance floor for :meth:`search_one`.
 
-        A single body-word match scores ``1.0 * idf``; the smallest possible
-        IDF for a word present in the KB (even when ``df == n`` in a small
-        corpus) is ``log(2) ≈ 0.693``. Flooring at ``min(0.5, log(1 + n))``
-        accepts genuine matches regardless of corpus size while rejecting
-        zero-score documents.
+        With BM25 length normalization and ``0.7x`` fuzzy weighting, a valid
+        match on a very long document or a common word in a small KB can
+        score below ``0.5``. Flooring at ``min(0.01, log(1 + n))`` accepts
+        genuine matches across document lengths and corpus sizes while
+        still rejecting zero-score documents.
         """
-        return min(0.5, math.log(1 + len(self.documents)))
+        return min(0.01, math.log(1 + len(self.documents)))
 
     def search_one(self, query: str, *, entity_only: bool = False) -> Optional[LoreDocument]:
         """Best single document for a query, or ``None`` if nothing scores.
@@ -693,17 +839,28 @@ class LoreEngine:
             return []
         exp_words, weights = self._expand(words)
         exp_only = exp_words[len(words):]
+        exp_weights = weights[len(words):]
         exclude = set(exclude)
         # Tier 1: keyword matches (always included — they anchor correctness).
         primary = set(self._candidates(words))
         # Tier 2: semantic-only matches, bounded so a generic query on a huge
-        # corpus cannot blow up the scoring loop.
+        # corpus cannot blow up the scoring loop. When exceeding budget,
+        # prioritize by total weight of matching expansion words (not key order).
         cand = sorted(primary)
         if exp_only and len(cand) < _RELEVANT_MAX_CANDIDATES:
-            secondary = set(self._candidates(exp_only)) - primary
-            if secondary:
+            sec_scores: Dict[int, float] = {}
+            for ew, ew_wgt in zip(exp_only, exp_weights):
+                for doc_idx in self._candidates([ew]):
+                    if doc_idx not in primary:
+                        sec_scores[doc_idx] = sec_scores.get(doc_idx, 0.0) + ew_wgt
+            if sec_scores:
                 budget = _RELEVANT_MAX_CANDIDATES - len(cand)
-                cand += sorted(secondary)[:budget]
+                ranked_sec = sorted(
+                    sec_scores,
+                    key=lambda idx: (-sec_scores[idx], self.documents[idx]["key"],
+                                     self.documents[idx]["category"], idx),
+                )
+                cand.extend(ranked_sec[:budget])
         scored = []
         for i in cand:
             doc = self.documents[i]

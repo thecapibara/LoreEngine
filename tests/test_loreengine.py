@@ -152,9 +152,12 @@ class TestTranslit(unittest.TestCase):
             with open(os.path.join(cat, "dark_knight.txt"), "w", encoding="utf-8") as f:
                 f.write("Dark Knight - a wandering mercenary.\n")
             engine = LoreEngine(tmp, lang=UK)
-            docs = engine.pages_for_entities(["Дарк Найта"])
+            docs = engine.get_pages(["Дарк Найта"])
             self.assertTrue(docs and docs[0]["key"] == "dark_knight",
                             f"got {[d['key'] for d in docs]}")
+            entity_docs = engine.pages_for_entities(["Дарк"])
+            self.assertTrue(entity_docs and entity_docs[0]["key"] == "dark_knight",
+                            f"got {[d['key'] for d in entity_docs]}")
 
 
 class TestAliases(unittest.TestCase):
@@ -470,10 +473,15 @@ class TestScale(unittest.TestCase):
                     got = eng.search_one(q)
                     words = eng._query_words(q)
                     best_i, best_s = -1, 0.0
+                    best_tie = None
                     for i in range(len(eng.documents)):
                         s = eng._score_doc(i, words)
-                        if s > best_s:
-                            best_i, best_s = i, s
+                        if s <= 0.0:
+                            continue
+                        doc = eng.documents[i]
+                        tie = (doc["key"], doc["category"])
+                        if s > best_s or (s == best_s and (best_tie is None or tie < best_tie)):
+                            best_i, best_s, best_tie = i, s, tie
                     full = eng.documents[best_i] if best_i >= 0 and best_s >= eng._min_score() else None
                     self.assertEqual(got and got["key"], full and full["key"],
                                      f"trial={trial} q={q!r}")
@@ -673,8 +681,15 @@ class TestReviewFixesRound2(unittest.TestCase):
                 doc = engine.search_one(q)
                 self.assertTrue(doc and doc["key"] == "family",
                                 f"q={q!r} got {doc}")
-            docs = engine.pages_for_entities(["сім'ю"])
+            docs = engine.get_pages(["сім'ю"])
             self.assertTrue(docs and docs[0]["key"] == "family")
+            # Entity dosing matches apostrophe variants via aliases/keys too.
+            with open(os.path.join(tmp, "lore", "clan.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Aliases: Сімʼю\nІсторія роду.\n")
+            engine2 = LoreEngine(tmp, lang=UK, verbose=False)
+            entity_docs = engine2.pages_for_entities(["сім'ю"])
+            self.assertTrue(entity_docs and entity_docs[0]["key"] == "clan")
 
     def test_max_pages_zero_or_negative_returns_empty(self):
         engine = LoreEngine(EXAMPLE_KB, lang=EN, verbose=False)
@@ -716,6 +731,180 @@ class TestReviewFixesRound2(unittest.TestCase):
             self.assertFalse(report.errors, report.errors)
             self.assertTrue(any("Yo" in i and "skipped" in i
                                 for i in report.infos), report.infos)
+
+
+class TestCommit1Fixes(unittest.TestCase):
+    """Unit tests for candidate fallback, entity dosing, min_score, tie-break, BOM/headers."""
+
+    def test_candidates_miss_returns_empty_not_full_scan(self):
+        engine = LoreEngine(EXAMPLE_KB, lang=EN, verbose=False)
+        self.assertTrue(engine._pref)
+        self.assertEqual(list(engine._candidates(["zzzznonexistent"])), [])
+        # Clearing both indexes still triggers brute-force fallback.
+        saved_pref, saved_short = engine._pref, engine._short_key
+        try:
+            engine._pref = {}
+            engine._short_key = {}
+            self.assertEqual(
+                list(engine._candidates(["zzzznonexistent"])),
+                list(range(len(engine.documents))),
+            )
+        finally:
+            engine._pref, engine._short_key = saved_pref, saved_short
+
+    def test_relevant_tier2_works_when_primary_empty(self):
+        # 2-doc KB where query hits doc A's co-occurrence neighbor on doc B,
+        # and exclude removes doc A so only Tier 2 doc B remains (even though
+        # len(secondary) == 1 and primary was manually emptied or excluded).
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "locations"))
+            with open(os.path.join(tmp, "locations", "forge.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("The forge burns hot. Smiths hammer steel.\n")
+            with open(os.path.join(tmp, "locations", "smithy.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("The smithy repairs armor near the forge.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            docs = engine.relevant("hammer", k=2, exclude=["forge"])
+            self.assertEqual([d["key"] for d in docs], ["smithy"])
+
+    def test_dosing_rejects_false_positives_and_accepts_valid_entities(self):
+        engine = LoreEngine(EXAMPLE_KB, lang=EN, verbose=False)
+        # False positives must return [].
+        self.assertEqual(engine.pages_for_entities(["Dark Stranger"]), [])
+        self.assertEqual(engine.pages_for_entities(["Dark Mysterious Stranger"]), [])
+        self.assertEqual(engine.pages_for_entities(["wolves"]), [])
+        # Valid entity names must still match dark_knight.
+        for name in ("Aldric Vane", "Ser Aldric", "Dark Knight", "Aldric",
+                     "Ser Aldric Vane"):
+            docs = engine.pages_for_entities([name])
+            self.assertEqual([d["key"] for d in docs], ["dark_knight"],
+                             f"name={name!r}")
+
+    def test_collect_pages_dedupes_by_category_and_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for cat, alias in (("characters", "VelvetRaven"),
+                               ("locations", "IronGate")):
+                os.makedirs(os.path.join(tmp, cat))
+                with open(os.path.join(tmp, cat, "shadow.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(f"Aliases: {alias}\nA page about {alias}.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            docs = engine.pages_for_entities(["VelvetRaven", "IronGate"])
+            self.assertEqual(
+                [(d["category"], d["key"]) for d in docs],
+                [("characters", "shadow"), ("locations", "shadow")],
+            )
+            docs_wiki = engine.get_pages(["VelvetRaven", "IronGate"])
+            self.assertEqual(len(docs_wiki), 2)
+
+    def test_min_score_accepts_high_df_small_kb(self):
+        # N=2, df=2 -> idf = log(2) = 0.693 < 1.0 (old min_score rejected this).
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "alpha.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Ancient guild chronicle.\n")
+            with open(os.path.join(tmp, "lore", "beta.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Ancient tavern tale.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            doc = engine.search_one("ancient")
+            self.assertIsNotNone(doc)
+            self.assertEqual(doc["key"], "alpha")
+
+        # N=3, df=2 -> idf = log(2.5) = 0.916 < 1.0.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            for k, body in (("first", "Shared relic story."),
+                            ("second", "Shared sword tale."),
+                            ("third", "Unrelated mountain lore.")):
+                with open(os.path.join(tmp, "lore", f"{k}.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(body + "\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            doc = engine.search_one("shared")
+            self.assertIsNotNone(doc)
+            self.assertEqual(doc["key"], "first")
+
+    def test_unified_tie_breaking_and_category_exclude(self):
+        # Category "characters" loads before "locations", but key "alpha" < "zeta".
+        # Both search_one() and relevant() must break ties by (key, category).
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            os.makedirs(os.path.join(tmp, "locations"))
+            with open(os.path.join(tmp, "characters", "zeta.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Obsidian amulet lore.\n")
+            with open(os.path.join(tmp, "locations", "alpha.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("Obsidian tower lore.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            self.assertEqual(engine.search_one("obsidian")["key"], "alpha")
+            self.assertEqual(
+                [d["key"] for d in engine.relevant("obsidian", k=2)],
+                ["alpha", "zeta"],
+            )
+
+        # Category-qualified exclude in relevant() targets only one category.
+        with tempfile.TemporaryDirectory() as tmp:
+            for cat in ("characters", "locations"):
+                os.makedirs(os.path.join(tmp, cat))
+                with open(os.path.join(tmp, cat, "hero.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(f"Obsidian {cat} entry.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            only_chars = engine.relevant("obsidian", k=2,
+                                         exclude=["locations/hero"])
+            self.assertEqual([(d["category"], d["key"]) for d in only_chars],
+                             [("characters", "hero")])
+            neither = engine.relevant("obsidian", k=2, exclude=["hero"])
+            self.assertEqual(neither, [])
+
+    def test_utf8_bom_and_polish_headers(self):
+        from loreengine import PL
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            with open(os.path.join(tmp, "characters", "wiedzmin.txt"), "w",
+                      encoding="utf-8-sig") as f:
+                f.write("Aliasy: Geralt z Rivii, Biały Wilk\n"
+                        "Tagi: łowca, miecz\n"
+                        "Zabójca potworów.\n")
+            engine = LoreEngine(tmp, lang=PL, verbose=False)
+            self.assertEqual(len(engine.documents), 1)
+            doc = engine.documents[0]
+            self.assertEqual(doc["aliases"], ["Geralt z Rivii", "Biały Wilk"])
+            self.assertEqual(doc["tags"], ["łowca", "miecz"])
+            self.assertNotIn("\ufeff", doc["content"])
+            self.assertEqual(engine.search_one("Biały Wilk")["key"], "wiedzmin")
+            self.assertEqual(engine.search_one("łowca")["key"], "wiedzmin")
+
+    def test_directory_listing_resilience_and_dir_ending_in_txt(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cat = os.path.join(tmp, "lore")
+            os.makedirs(os.path.join(cat, "subdir.txt"))  # dir ending in .txt
+            with open(os.path.join(cat, "real.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("A real page about dragons.\n")
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            self.assertEqual([d["key"] for d in engine.documents], ["real"])
+
+            # OSError from os.listdir on kb_dir or cat_path is handled gracefully.
+            with mock.patch("loreengine.engine.os.listdir",
+                            side_effect=PermissionError("denied")):
+                engine_err = LoreEngine(tmp, lang=EN, verbose=False)
+                self.assertEqual(engine_err.documents, [])
+
+            real_listdir = os.listdir
+            def fail_cat(path):
+                if path == cat:
+                    raise PermissionError("denied")
+                return real_listdir(path)
+
+            with mock.patch("loreengine.engine.os.listdir", side_effect=fail_cat):
+                engine_cat_err = LoreEngine(tmp, lang=EN, verbose=False)
+                self.assertEqual(engine_cat_err.documents, [])
 
 
 if __name__ == "__main__":

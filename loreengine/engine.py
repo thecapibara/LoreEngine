@@ -171,6 +171,7 @@ class LoreEngine:
         self.documents: List[LoreDocument] = []
         self._words: List[Set[str]] = []      # body words, parallel to documents
         self._key_words: List[Set[str]] = []  # key/name/alias words, parallel
+        self._title_words: List[Set[str]] = []  # first-line "Name - ..." words, parallel
         # Per-doc 3-char-prefix -> body words. words_match acceptance implies a
         # shared >=3-char prefix, so scoring against only this bucket (instead
         # of every body word) is provably identical and sub-linear in doc length.
@@ -214,11 +215,11 @@ class LoreEngine:
             if ":" in stripped:
                 key, _, val = stripped.partition(":")
                 k = key.strip().lower()
-                if k in ("aliases", "alias", "аліаси"):
+                if k in ("aliases", "alias", "аліаси", "aliasy"):
                     aliases.extend(a.strip() for a in val.split(",") if a.strip())
                     start = i + 1
                     continue
-                if k in ("tags", "tag", "теги"):
+                if k in ("tags", "tag", "теги", "tagi"):
                     tags.extend(t.strip() for t in val.split(",") if t.strip())
                     start = i + 1
                     continue
@@ -236,6 +237,7 @@ class LoreEngine:
         self.documents = []
         self._words = []
         self._key_words = []
+        self._title_words = []
         self._body_pref = []
         self._df = {}
         self._pref = {}
@@ -248,15 +250,28 @@ class LoreEngine:
         if not os.path.isdir(self.kb_dir):
             self._log(f"[LoreEngine] Folder '{self.kb_dir}' not found — lore is empty.")
             return
-        for category in sorted(os.listdir(self.kb_dir)):
+        try:
+            categories = sorted(os.listdir(self.kb_dir))
+        except OSError as e:
+            self._log(f"[LoreEngine] Could not list '{self.kb_dir}': {e}")
+            return
+        for category in categories:
             cat_path = os.path.join(self.kb_dir, category)
             if not os.path.isdir(cat_path):
                 continue
-            for filename in sorted(os.listdir(cat_path)):
+            try:
+                filenames = sorted(os.listdir(cat_path))
+            except OSError as e:
+                self._log(f"[LoreEngine] Could not list '{cat_path}': {e}")
+                continue
+            for filename in filenames:
                 if not filename.endswith(".txt"):
                     continue
+                filepath = os.path.join(cat_path, filename)
+                if not os.path.isfile(filepath):
+                    continue
                 try:
-                    with open(os.path.join(cat_path, filename), "r", encoding="utf-8") as f:
+                    with open(filepath, "r", encoding="utf-8-sig") as f:
                         raw = f.read()
                 except (OSError, UnicodeDecodeError) as e:
                     self._log(f"[LoreEngine] Could not read {filename}: {e}")
@@ -298,6 +313,11 @@ class LoreEngine:
                         bp.setdefault(bw[:3], set()).add(bw)
                 self._body_pref.append(bp)
                 self._key_words.append(key_words)
+                first_line = content.split("\n", 1)[0]
+                title_parts = re.split(r"\s+[-—–]\s+", first_line, maxsplit=1)
+                self._title_words.append(
+                    set(tokenize(title_parts[0])) if len(title_parts) > 1 else set()
+                )
         # Document frequency (content words + latin keys + aliases + tags)
         for i in range(len(self.documents)):
             for w in self._words[i] | self._key_words[i]:
@@ -480,11 +500,24 @@ class LoreEngine:
         out_weights = [1.0] * len(words) + [_COOC_WEIGHT] * len(top)
         return out_words, out_weights
 
+    def _word_matches_set(self, w: str, words: Set[str]) -> bool:
+        """True if query word ``w`` (or its transliteration) matches ``words``."""
+        tw = self._translit(w)
+        if tw in words or w in words:
+            return True
+        return any(words_match(tw, kw) or words_match(w, kw) for kw in words)
+
     def _score_doc(self, i: int, words: List[str],
-                   weights: Optional[List[float]] = None) -> float:
+                   weights: Optional[List[float]] = None,
+                   *, entity_only: bool = False) -> float:
         """Score document #i against query words (TF-IDF + translit + prefixes).
 
         ``weights`` (parallel to ``words``) discounts semantic expansion words.
+        When ``entity_only=True`` (scene entity dosing), only ``key_words``
+        (key, name, aliases, tags) are scored — body text alone never produces
+        a match, and multi-word queries require more than half of their words
+        to match ``key_words`` (or all words to match ``key_words`` plus the
+        page's ``Name - ...`` first-line title with at least one key hit).
         Exact set membership is checked before the fuzzy loop as a fast path
         (exact match is a subset of :func:`words_match`, so results are
         identical). Fuzzy body matching is restricted to the document's
@@ -496,6 +529,7 @@ class LoreEngine:
         key_words = self._key_words[i]
         body_words = self._words[i]
         body_pref = self._body_pref[i]
+        key_hits = 0
         for idx, w in enumerate(words):
             mult = weights[idx] if weights else 1.0
             tw = self._translit(w)
@@ -509,15 +543,35 @@ class LoreEngine:
             # Hit on the document key/name/aliases/tags (latin via translit, or native)
             if tw in key_words or w in key_words:
                 score += mult * (3.0 * idf + 2.0)
+                key_hits += 1
             elif any(words_match(tw, kw) or words_match(w, kw) for kw in key_words):
                 score += mult * (3.0 * idf + 2.0)
-            # Hit on a word in the body (fuzzy — handles case endings)
-            elif w in body_words:
-                score += mult * (1.0 * idf)
-            else:
-                bucket = body_pref.get(w[:3])  # query/cooc words are always >=3 chars
-                if bucket and any(words_match(w, cw) for cw in bucket):
-                    score += mult * (1.0 * idf)
+                key_hits += 1
+            elif not entity_only:
+                # Hit on a word in the body (fuzzy — handles case endings)
+                hit = w in body_words
+                if not hit:
+                    bucket = body_pref.get(w[:3])  # query/cooc words are always >=3 chars
+                    hit = bool(bucket and any(words_match(w, cw) for cw in bucket))
+                if hit:
+                    # Slight boost when the matched word is in the page's
+                    # "Name - ..." first-line title, so a page about X outranks
+                    # a page that merely mentions X in its body.
+                    title_words = self._title_words[i]
+                    in_title = w in title_words or any(
+                        words_match(w, tw_) for tw_ in title_words
+                    )
+                    score += mult * ((1.5 if in_title else 1.0) * idf)
+        if entity_only:
+            if not key_hits:
+                return 0.0
+            if len(words) >= 2 and key_hits * 2 <= len(words):
+                title_words = self._title_words[i]
+                if not title_words:
+                    return 0.0
+                allowed = key_words | title_words
+                if not all(self._word_matches_set(w, allowed) for w in words):
+                    return 0.0
         return score
 
     def _candidates(self, words: List[str]) -> Sequence[int]:
@@ -529,11 +583,11 @@ class LoreEngine:
         filters precisely. A transliteration shorter than 3 chars can only
         match a short word exactly, so it is resolved through the verbatim
         ``_short_key`` index instead of forcing a full scan. Falls back to a
-        full scan only when the index is empty or yields no candidates.
+        full scan only when both indexes are empty; an index miss returns
+        ``()`` instead of scanning the entire corpus.
         """
-        all_idx = range(len(self.documents))
         if not self._pref and not self._short_key:
-            return all_idx
+            return range(len(self.documents))
         cand: Set[int] = set()
         for w in words:
             tw = self._translit(w)
@@ -545,34 +599,40 @@ class LoreEngine:
                 # is possible, and _short_key vouches for those.
                 cand |= self._short_key.get(tw, set())
         if not cand:
-            return all_idx
+            return ()
         return sorted(cand)
 
     def _min_score(self) -> float:
         """Acceptance floor for :meth:`search_one`.
 
-        A single body-word match scores ``1.0 * idf``; the largest possible
-        IDF is ``log(1 + n)`` (a word in exactly one document). On tiny
-        corpora that ceiling sits below the nominal ``1.0`` floor, which
-        would reject a genuine match on a one-page KB. Flooring the
-        threshold at ``log(1 + n)`` fixes the degenerate case while leaving
-        any corpus with ``n >= 2`` unchanged (there ``log(1 + n) >= 1.0``).
+        A single body-word match scores ``1.0 * idf``; the smallest possible
+        IDF for a word present in the KB (even when ``df == n`` in a small
+        corpus) is ``log(2) ≈ 0.693``. Flooring at ``min(0.5, log(1 + n))``
+        accepts genuine matches regardless of corpus size while rejecting
+        zero-score documents.
         """
-        return min(1.0, math.log(1 + len(self.documents)))
+        return min(0.5, math.log(1 + len(self.documents)))
 
-    def search_one(self, query: str) -> Optional[LoreDocument]:
+    def search_one(self, query: str, *, entity_only: bool = False) -> Optional[LoreDocument]:
         """Best single document for a query, or ``None`` if nothing scores.
 
         Public wrapper over the weighted search used by dosing/wiki-lookup.
+        When ``entity_only=True``, restricts matches to entity metadata
+        (keys, names, aliases, tags) rather than arbitrary body words.
         """
         words = self._query_words(query)
         if not words:
             return None
         best, best_score = -1, 0.0
+        best_tie: Optional[Tuple[str, str]] = None
         for i in self._candidates(words):
-            s = self._score_doc(i, words)
-            if s > best_score:
-                best, best_score = i, s
+            s = self._score_doc(i, words, entity_only=entity_only)
+            if s <= 0.0:
+                continue
+            doc = self.documents[i]
+            tie = (doc["key"], doc["category"])
+            if s > best_score or (s == best_score and (best_tie is None or tie < best_tie)):
+                best, best_score, best_tie = i, s, tie
         if best < 0 or best_score < self._min_score():
             return None
         return self.documents[best]
@@ -581,10 +641,11 @@ class LoreEngine:
     def _find_best(self, query: str) -> Optional[LoreDocument]:
         return self.search_one(query)
 
-    def get_pages(self, queries: Iterable[object], max_pages: int = 3) -> List[LoreDocument]:
-        """DOCUMENTS for a list of queries (wiki-lookup), deduplicated."""
+    def _collect_pages(self, queries: Iterable[object], max_pages: int,
+                       *, entity_only: bool = False) -> List[LoreDocument]:
+        """Resolve an iterable of queries to unique documents, up to max_pages."""
         docs: List[LoreDocument] = []
-        seen = set()
+        seen: Set[Tuple[str, str]] = set()
         if max_pages <= 0:
             return docs
         for q in queries or []:
@@ -594,28 +655,21 @@ class LoreEngine:
             # budget is full, stop instead of appending one page past it.
             if len(docs) >= max_pages:
                 break
-            doc = self.search_one(q.strip())
-            if doc and doc["key"] not in seen:
-                seen.add(doc["key"])
-                docs.append(doc)
+            doc = self.search_one(q.strip(), entity_only=entity_only)
+            if doc:
+                doc_id = (doc["category"], doc["key"])
+                if doc_id not in seen:
+                    seen.add(doc_id)
+                    docs.append(doc)
         return docs
+
+    def get_pages(self, queries: Iterable[object], max_pages: int = 3) -> List[LoreDocument]:
+        """DOCUMENTS for a list of queries (wiki-lookup), deduplicated."""
+        return self._collect_pages(queries, max_pages, entity_only=False)
 
     def pages_for_entities(self, names: Iterable[object], max_pages: int = 6) -> List[LoreDocument]:
         """DOCUMENTS for the entity names of the current scene (dosing)."""
-        docs: List[LoreDocument] = []
-        seen = set()
-        if max_pages <= 0:
-            return docs
-        for name in names or []:
-            if not isinstance(name, str) or not name.strip():
-                continue
-            if len(docs) >= max_pages:
-                break
-            doc = self.search_one(name.strip())
-            if doc and doc["key"] not in seen:
-                seen.add(doc["key"])
-                docs.append(doc)
-        return docs
+        return self._collect_pages(names, max_pages, entity_only=True)
 
     def relevant(self, query: str, k: int = 2, exclude: Iterable[str] = ()) -> List[LoreDocument]:
         """Targeted search: up to k DOCUMENTS relevant to the query.
@@ -647,21 +701,21 @@ class LoreEngine:
         cand = sorted(primary)
         if exp_only and len(cand) < _RELEVANT_MAX_CANDIDATES:
             secondary = set(self._candidates(exp_only)) - primary
-            # A full-scan fallback here means the index cannot vouch; skip the
-            # semantic tier rather than score the entire corpus.
-            if len(secondary) < len(self.documents):
+            if secondary:
                 budget = _RELEVANT_MAX_CANDIDATES - len(cand)
                 cand += sorted(secondary)[:budget]
         scored = []
         for i in cand:
-            if self.documents[i]["key"] in exclude:
+            doc = self.documents[i]
+            if doc["key"] in exclude or f"{doc['category']}/{doc['key']}" in exclude:
                 continue
             s = self._score_doc(i, exp_words, weights)
             if s > 0:
                 scored.append((s, i))
-        # Deterministic tie-break by page key (not scan order), so equal
-        # scores never depend on filesystem enumeration order.
-        scored.sort(key=lambda x: (-x[0], self.documents[x[1]]["key"]))
+        # Deterministic tie-break by (key, category), so equal scores never
+        # depend on category or filesystem enumeration order.
+        scored.sort(key=lambda x: (-x[0], self.documents[x[1]]["key"],
+                                  self.documents[x[1]]["category"]))
         return [self.documents[i] for _, i in scored[:k]]
 
     # --------------------------------------------------------------- helpers

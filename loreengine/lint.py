@@ -42,9 +42,8 @@ DOC_WARN_CHARS = 3500
 
 # Latin snake_case key for knowledge base files
 _KEY_RE = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
-# Quoted names/nicknames in a page's first line. Open/close pairs must
-# match: "X", “X”, «X» — never “X» or «Y”.
-_QUOTED_RE = re.compile(r'"([^"]{3,30})"|“([^”]{3,30})”|«([^»]{3,30})»')
+# Canonical title/header separator on a document's first line.
+_TITLE_SPLIT_RE = re.compile(r"\s+[-—–]\s+|,")
 
 
 class Report:
@@ -91,14 +90,24 @@ def loose_words_match(w1: str, w2: str) -> bool:
     return common >= 4 and common >= min(len(w1), len(w2)) - 2
 
 
-def mention_hits_entity(candidate: str, known: str) -> bool:
-    """Does the candidate mention the known entity: at least one meaningful
-    word of the candidate fuzzy-matches a word of the known name."""
-    cw = name_words(candidate)
-    kw = name_words(known)
-    if not cw or not kw:
+def _words_hit_target(cw: List[str], kw: Iterable[str]) -> bool:
+    """True when candidate words sufficiently overlap target words."""
+    kw_list = list(kw)
+    if not cw or not kw_list:
         return False
-    return any(loose_words_match(c, k) for c in cw for k in kw)
+    if len(cw) == 1:
+        return any(loose_words_match(cw[0], k) for k in kw_list)
+    matched = sum(
+        1 for c in set(cw) if any(loose_words_match(c, k) for k in kw_list)
+    )
+    return matched == len(cw) or (matched >= 2 and matched * 2 >= len(cw))
+
+
+def mention_hits_entity(candidate: str, known: str) -> bool:
+    """Does the candidate mention the known entity: single-word mentions match
+    any word of the known name; multi-word mentions require >= 2 and at least
+    half of the candidate's words (or all of them) to match."""
+    return _words_hit_target(name_words(candidate), name_words(known))
 
 
 def _same_alias_form(a: str, b: str) -> bool:
@@ -113,12 +122,17 @@ def _same_alias_form(a: str, b: str) -> bool:
             and all(loose_words_match(x, y) for x, y in zip(wa, wb)))
 
 
+def _extract_quoted_text(match: re.Match) -> str:
+    """Return the first non-empty capture group from a quoted-name match."""
+    return next((g for g in match.groups() if g is not None), match.group(0)).strip()
+
+
 # ------------------------------------------------------------------ registry
 def build_kb_registry(engine: LoreEngine) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Registry of known names from the KB itself:
 
-    - kb_names: canonical name -> document key (from the first line of
-      ``characters`` pages: text before the first " - " or ",");
+    - kb_names: canonical name -> document key (from any page's first line
+      before the first dash/comma when short, plus the document's ``name``);
     - kb_aliases: explicit ``Aliases:`` header entries plus quoted
       nicknames/names from any page's first line ("Doc", «Tavern»)
       -> document key.
@@ -131,14 +145,21 @@ def build_kb_registry(engine: LoreEngine) -> Tuple[Dict[str, str], Dict[str, str
         for alias in doc.get("aliases", []):
             kb_aliases.setdefault(alias, doc["key"])
         first_line = doc["content"].split("\n", 1)[0].replace("*", "")
-        if doc["category"] == "characters":
-            head = re.split(r"\s+-\s+|,", first_line, maxsplit=1)[0].strip()
-            if intro_re:
-                head = intro_re.split(head)[0].strip(" ,")
-            if head:
-                kb_names[head] = doc["key"]
-        for m in _QUOTED_RE.finditer(first_line):
-            alias = next(g for g in m.groups() if g is not None).strip()
+        parts = _TITLE_SPLIT_RE.split(first_line, maxsplit=1)
+        has_sep = len(parts) > 1
+        head = parts[0].strip()
+        if intro_re:
+            head = intro_re.split(head)[0].strip(" ,")
+        if (
+            head
+            and len(head.split()) <= 6
+            and (has_sep or not head.endswith((".", "!", "?", ";", ":")))
+        ):
+            kb_names.setdefault(head, doc["key"])
+        if doc.get("name"):
+            kb_names.setdefault(doc["name"], doc["key"])
+        for m in re.finditer(engine.lang.quoted_regex, first_line):
+            alias = _extract_quoted_text(m)
             if not alias or not alias[0].isupper():
                 continue
             # Skip case-forms of already registered aliases (see
@@ -171,7 +192,7 @@ def extract_mentions(text: str, lang: LanguagePack) -> List[Tuple[str, int]]:
     for m in re.finditer(lang.name_regex, text):
         found.append((m.group(0), m.start()))
     for m in re.finditer(lang.quoted_regex, text):
-        name = next((g for g in m.groups() if g), "").strip()
+        name = _extract_quoted_text(m)
         if name:
             found.append((name, m.start()))
     return found
@@ -196,9 +217,11 @@ def is_noise(name: str, lang: LanguagePack) -> bool:
 
 
 def doc_title_words(doc: LoreDocument) -> Set[str]:
-    """Words of the document title (first line before ' - ') — for self-refs."""
-    first_line = doc["content"].split("\n", 1)[0].replace("*", "").replace('"', ' ')
-    title = first_line.split(" - ")[0][:80]
+    """Words of the document title (first line before delimiter) — for self-refs."""
+    first_line = doc["content"].split("\n", 1)[0]
+    for ch in ("*", '"', "“", "”", "«", "»", "„"):
+        first_line = first_line.replace(ch, " ")
+    title = _TITLE_SPLIT_RE.split(first_line, maxsplit=1)[0][:80]
     return set(normalize(title).split())
 
 
@@ -207,8 +230,8 @@ def is_self_reference(doc: LoreDocument, name: str) -> bool:
     cw = name_words(name)
     if not cw:
         return True
-    title_words = doc_title_words(doc)
-    return any(loose_words_match(c, t) for c in cw for t in title_words)
+    title_words = [w for w in doc_title_words(doc) if len(w) >= 3]
+    return _words_hit_target(cw, title_words)
 
 
 # --------------------------------------------------------------------- lint

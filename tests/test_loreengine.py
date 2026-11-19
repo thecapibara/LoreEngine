@@ -1087,5 +1087,159 @@ class TestCommit2Improvements(unittest.TestCase):
                 eng_mod._RELEVANT_MAX_CANDIDATES = old_cap
 
 
+class TestCommit3LintAndLangFixes(unittest.TestCase):
+    """Tests for LanguagePack immutability, regex fixes, noise filters, registry, and lint matching."""
+
+    def test_translit_is_immutable(self):
+        from loreengine import PL, LanguagePack
+
+        for pack in (UK, EN, PL, LanguagePack(translit={"а": "a"})):
+            with self.assertRaises(TypeError):
+                pack.translit["x"] = "y"  # type: ignore[index]
+
+    def test_name_regex_no_newline_crossing_and_accented_en(self):
+        from loreengine import PL
+        from loreengine.lint import extract_mentions
+
+        en_mentions = [m for m, _ in extract_mentions("Chapter One\nThe Hero", EN)]
+        self.assertEqual(en_mentions, ["Chapter One", "The Hero"])
+        self.assertNotIn("One\nThe", en_mentions)
+
+        uk_mentions = [m for m, _ in extract_mentions("Розділ Перший\nДругий Герой", UK)]
+        self.assertEqual(uk_mentions, ["Розділ Перший", "Другий Герой"])
+
+        pl_mentions = [m for m, _ in extract_mentions("Rozdział Pierwszy\nDrugi Bohater", PL)]
+        self.assertEqual(pl_mentions, ["Rozdział Pierwszy", "Drugi Bohater"])
+
+        accented = [
+            m for m, _ in extract_mentions("She met Élodie Moreau at Café Lumière.", EN)
+        ]
+        self.assertEqual(accented, ["Élodie Moreau", "Café Lumière"])
+
+    def test_quoted_regex_multiword_uk_apostrophes_and_sentence_guard(self):
+        import re
+        from loreengine import PL
+        from loreengine.lint import _extract_quoted_text
+
+        def quoted_only(text, pack):
+            return [_extract_quoted_text(m) for m in re.finditer(pack.quoted_regex, text)]
+
+        uk_text = 'Згадки: «Стара Таверна», «Таверна на Сході», «Сім\u02bcя», «Мар\u2019яна».'
+        self.assertEqual(
+            quoted_only(uk_text, UK),
+            ["Стара Таверна", "Таверна на Сході", "Сім\u02bcя", "Мар\u2019яна"],
+        )
+
+        en_text = (
+            'He entered "Old Tavern" and heard "This is a full quoted sentence." '
+            'and "One two three four five" and "Line one\nLine two".'
+        )
+        self.assertEqual(quoted_only(en_text, EN), ["Old Tavern"])
+
+        pl_found = quoted_only('Weszła do "Stary Zamek" i «Biały Wilk».', PL)
+        self.assertEqual(pl_found, ["Stary Zamek", "Biały Wilk"])
+
+    def test_uk_domain_place_names_not_discarded_as_noise(self):
+        from loreengine.lint import is_noise
+
+        self.assertFalse(is_noise("Старий Бар", UK))
+        self.assertFalse(is_noise("Нове Місто", UK))
+        self.assertFalse(is_noise("Центральний Клуб", UK))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "lore", "rumors.txt"), "w", encoding="utf-8") as f:
+                f.write("Чутки долини.\nЛюди збиралися в Старий Бар щовечора.\n")
+            report = lint_kb(tmp, lang=UK)
+            self.assertTrue(
+                any("Старий Бар" in w for w in report.warnings),
+                report.warnings,
+            )
+
+    def test_en_leading_stop_strips_articles_and_prepositions(self):
+        from loreengine.lint import strip_leading_stop
+
+        for src, expected in (
+            ("In Old Tavern", "Old Tavern"),
+            ("On Dark Road", "Dark Road"),
+            ("At Silver Gate", "Silver Gate"),
+            ("The Dark Knight", "Dark Knight"),
+            ("A Wandering Bard", "Wandering Bard"),
+            ("An Ancient Relic", "Ancient Relic"),
+        ):
+            self.assertEqual(strip_leading_stop(src, EN), expected)
+
+    def test_registry_supports_all_categories_and_dashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for cat, key, body in (
+                ("npcs", "elodie", "Élodie Moreau — a courier from the coast.\n"),
+                ("locations", "old_tavern", "Old Tavern – the crossroads inn.\n"),
+                ("lore", "valley_story", "Mentions Élodie Moreau and Old Tavern.\n"),
+            ):
+                os.makedirs(os.path.join(tmp, cat), exist_ok=True)
+                with open(os.path.join(tmp, cat, f"{key}.txt"), "w", encoding="utf-8") as f:
+                    f.write(body)
+            engine = LoreEngine(tmp, lang=EN, verbose=False)
+            kb_names, _kb_aliases = build_kb_registry(engine)
+            self.assertEqual(kb_names.get("Élodie Moreau"), "elodie")
+            self.assertEqual(kb_names.get("Old Tavern"), "old_tavern")
+            self.assertEqual(kb_names.get("old tavern"), "old_tavern")
+            report = lint_kb(tmp, lang=EN)
+            self.assertEqual(report.errors, [], report.errors)
+            self.assertEqual(report.warnings, [], report.warnings)
+
+        # Ukrainian category folder (персонажі/) and em-dash works too.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "персонажі"))
+            os.makedirs(os.path.join(tmp, "події"))
+            with open(os.path.join(tmp, "персонажі", "taras_bulba.txt"), "w", encoding="utf-8") as f:
+                f.write("Тарас Бульба — козацький полковник.\n")
+            with open(os.path.join(tmp, "події", "chronicle.txt"), "w", encoding="utf-8") as f:
+                f.write("Хроніка краю.\nПро це згадував Тарас Бульба.\n")
+            engine = LoreEngine(tmp, lang=UK, verbose=False)
+            kb_names, _ = build_kb_registry(engine)
+            self.assertEqual(kb_names.get("Тарас Бульба"), "taras_bulba")
+            report = lint_kb(tmp, lang=UK)
+            self.assertEqual(report.errors, [], report.errors)
+            self.assertEqual(report.warnings, [], report.warnings)
+
+    def test_tightened_cross_ref_and_self_ref_matching(self):
+        from loreengine.lint import is_self_reference, mention_hits_entity
+
+        self.assertFalse(mention_hits_entity("Ser Bob", "Ser Aldric Vane"))
+        self.assertTrue(mention_hits_entity("Aldric", "Ser Aldric Vane"))
+        self.assertTrue(mention_hits_entity("Aldric Vane", "Ser Aldric Vane"))
+        self.assertTrue(mention_hits_entity("Ser Aldric", "Ser Aldric Vane"))
+
+        doc = {
+            "key": "dragon_legend",
+            "category": "lore",
+            "name": "dragon legend",
+            "content": "The Dragon of the Northern Pass - an old legend.\n",
+            "aliases": [],
+            "tags": [],
+        }
+        self.assertFalse(is_self_reference(doc, "Northern Kingdom"))
+        self.assertTrue(is_self_reference(doc, "Northern Pass"))
+        self.assertTrue(is_self_reference(doc, "Dragon"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "characters"))
+            os.makedirs(os.path.join(tmp, "lore"))
+            with open(os.path.join(tmp, "characters", "dark_knight.txt"), "w", encoding="utf-8") as f:
+                f.write("Ser Aldric Vane - a wandering mercenary.\n")
+            with open(os.path.join(tmp, "lore", "dragon_legend.txt"), "w", encoding="utf-8") as f:
+                f.write(
+                    "The Dragon of the Northern Pass - an old legend.\n"
+                    "Riders from Northern Kingdom once met Ser Bob here.\n"
+                )
+            report = lint_kb(tmp, lang=EN)
+            self.assertTrue(any("Ser Bob" in w for w in report.warnings), report.warnings)
+            self.assertTrue(
+                any("Northern Kingdom" in w for w in report.warnings),
+                report.warnings,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

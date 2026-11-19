@@ -17,7 +17,30 @@ in the engine is language-specific.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet
+import types
+from typing import FrozenSet, Mapping
+
+
+def _name_regex(upper: str, word: str) -> str:
+    """Build proper-name candidate regex (2-3 capitalized words, same line)."""
+    return rf"\b[{upper}][{word}]+(?:[ \t]+[{upper}][{word}]+){{1,2}}\b"
+
+
+def _quoted_regex(upper: str, word: str) -> str:
+    """Build quoted name/alias regex (1-4 words, matched quote pairs, no newlines/sentences)."""
+    inner = (
+        rf"[{upper}]"
+        rf"(?:[{word}]{{0,20}}(?:[ \t]+[{word}]{{1,20}}){{1,3}}|[{word}]{{2,30}})"
+    )
+    return rf'"({inner})"|“({inner})”|«({inner})»|„({inner})”'
+
+
+_EN_UPPER = r"A-ZÀ-ÖØ-Þ"
+_EN_WORD = r"a-zà-öø-ÿA-ZÀ-ÖØ-Þ'\u2019\-"
+_UK_UPPER = r"А-ЯІЇЄҐ"
+_UK_WORD = r"а-яіїєґА-ЯІЇЄҐ'\u02bc\u2019\-"
+_PL_UPPER = r"A-ZĄĆĘŁŃÓŚŹŻ"
+_PL_WORD = r"a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ'\u2019\-"
 
 
 @dataclass(frozen=True)
@@ -28,13 +51,13 @@ class LanguagePack:
     stopwords: FrozenSet[str] = frozenset()
 
     #: Player-alphabet char -> latin string bridge for matching file keys.
-    translit: Dict[str, str] = field(default_factory=dict)
+    translit: Mapping[str, str] = field(default_factory=dict)
 
     #: Linter: regex finding proper-name candidates (2-3 capitalized words).
-    name_regex: str = r"\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b"
+    name_regex: str = _name_regex(_EN_UPPER, _EN_WORD)
 
     #: Linter: regex finding quoted names/nicknames ("Doc", «Doc»).
-    quoted_regex: str = r'"([A-Z][A-Za-z\'\-]{2,})"'
+    quoted_regex: str = _quoted_regex(_EN_UPPER, _EN_WORD)
 
     #: Linter: words that start sentences but are not names (noise filter).
     sentence_starters: FrozenSet[str] = frozenset()
@@ -46,6 +69,12 @@ class LanguagePack:
     #: Linter: intro words stripped from a character page header to get the
     #: canonical name ("... better known as X" -> cut before it).
     alias_intro_regex: str = r"\bbetter known as\b|\bknown as\b|\bnamed\b"
+
+    def __post_init__(self) -> None:
+        # Freeze translit mapping so frozen LanguagePack instances cannot be mutated.
+        object.__setattr__(
+            self, "translit", types.MappingProxyType(dict(self.translit))
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -67,28 +96,14 @@ UK = LanguagePack(
         'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch',
         'ш': 'sh', 'щ': 'shch', 'ь': '', 'ю': 'yu', 'я': 'ya',
     },
-    name_regex=(
-        r"\b[А-ЯІЇЄҐ][а-яіїєґА-ЯІЇЄҐ'\-]+"
-        r"(?:\s+[А-ЯІЇЄҐ][а-яіїєґА-ЯІЇЄҐ'\-]+){1,2}\b"
-    ),
-    quoted_regex=(
-        r'[\"“]([А-ЯІЇЄҐ][а-яіїєґА-ЯІЇЄҐ\'\-]{2,})[\"”]|'
-        r'«([А-ЯІЇЄҐ][а-яіїєґА-ЯІЇЄҐ\'\-]{2,})»'
-    ),
+    name_regex=_name_regex(_UK_UPPER, _UK_WORD),
+    quoted_regex=_quoted_regex(_UK_UPPER, _UK_WORD),
     sentence_starters=frozenset({
         "він", "вона", "воно", "вони", "це", "цей", "ця", "ці", "той", "та", "те",
-        "місто", "міста", "місті", "клуб", "будинок", "будинку", "вулиця", "вулиці",
-        "площа", "університет", "університету", "відділок", "відділку", "справа",
-        "справи", "справі", "ніч", "ночі", "ранок", "ранку", "день", "дня", "вечір",
-        "вечора", "кімната", "кімнаті", "кабінет", "кабінеті", "бар", "барі",
-        "ринок", "ринку", "вокзал", "вокзалу", "парк", "парку", "міст", "мосту",
+        "справа", "справи", "справі", "ніч", "ночі", "ранок", "ранку", "день",
+        "дня", "вечір", "вечора", "кімната", "кімнаті", "кабінет", "кабінеті",
         "машина", "машини", "двері", "дверей", "телефон", "телефону", "документ",
-        "документи", "архів", "архіву", "суд", "суду", "школа", "школі", "лікарня",
-        "лікарні", "церква", "церкві", "завод", "заводу", "готель", "готелі",
-        "ресторан", "ресторані", "магазин", "магазині", "кіоск", "кіоску",
-        "управління", "відділ", "відділі", "район", "районі", "область", "області",
-        "країна", "країни", "державний", "державна", "національний", "центральний",
-        "старий", "стара", "старе", "новий", "нова", "нове", "великий", "велика",
+        "документи",
         "один", "одна", "одне", "двоє", "троє", "кілька", "багато", "майже",
         "саме", "навіть", "одного", "якось", "колись", "тоді", "тепер", "згодом",
         "за", "зі", "з", "від", "на", "у", "в", "до", "по", "при",
@@ -120,8 +135,8 @@ EN = LanguagePack(
         "not", "and", "for", "with", "from", "into", "then", "now", "all",
     }),
     translit={},
-    name_regex=r"\b[A-Z][a-zA-Z'\-]+(?:\s+[A-Z][a-zA-Z'\-]+){1,2}\b",
-    quoted_regex=r'"([A-Z][A-Za-z\'\-]{2,})"',
+    name_regex=_name_regex(_EN_UPPER, _EN_WORD),
+    quoted_regex=_quoted_regex(_EN_UPPER, _EN_WORD),
     sentence_starters=frozenset({
         "the", "a", "an", "this", "that", "these", "those", "it", "its", "he",
         "she", "they", "there", "here", "city", "town", "village", "house",
@@ -135,6 +150,7 @@ EN = LanguagePack(
         "while", "if", "although", "perhaps", "maybe",
     }),
     leading_stop=frozenset({
+        "in", "on", "at", "the", "a", "an",
         "for", "although", "today", "even", "suddenly", "finally", "once",
         "afterwards", "then", "now", "later", "but", "however", "also",
         "because", "so", "thus", "perhaps", "maybe", "probably", "certainly",
@@ -158,8 +174,8 @@ PL = LanguagePack(
         'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o',
         'ś': 's', 'ź': 'z', 'ż': 'z',
     },
-    name_regex=r"\b[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ'\-]+(?:\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ'\-]+){1,2}\b",
-    quoted_regex=r'"([A-ZĄĆĘŁŃÓŚŹŻ][A-Za-ząćęłńóśźż\'\-]{2,})"',
+    name_regex=_name_regex(_PL_UPPER, _PL_WORD),
+    quoted_regex=_quoted_regex(_PL_UPPER, _PL_WORD),
     sentence_starters=frozenset({
         "on", "ona", "ono", "oni", "to", "ten", "ta", "te", "miasto", "miasta",
         "klub", "dom", "domu", "ulica", "ulicy", "plac", "uniwersytet", "komisariat",

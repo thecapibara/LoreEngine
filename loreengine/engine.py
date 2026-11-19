@@ -497,8 +497,8 @@ class LoreEngine:
                 (nb, self._cooc_weight(w, nb, cnt))
                 for nb, cnt in nbs.items()
             ]
-            top = sorted(scored, key=lambda kv: (-kv[1], kv[0]))[:_COOC_NEIGHBORS]
-            self._cooc[w] = dict(top)
+            top_scored = sorted(scored, key=lambda kv: (-kv[1], kv[0]))[:_COOC_NEIGHBORS]
+            self._cooc[w] = dict(top_scored)
 
     @staticmethod
     def _first_sentence(text: str, limit: int = 140) -> str:

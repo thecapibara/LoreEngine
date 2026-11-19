@@ -122,9 +122,12 @@ def _same_alias_form(a: str, b: str) -> bool:
             and all(loose_words_match(x, y) for x, y in zip(wa, wb)))
 
 
-def _extract_quoted_text(match: re.Match) -> str:
+def _extract_quoted_text(match: "re.Match[str]") -> str:
     """Return the first non-empty capture group from a quoted-name match."""
-    return next((g for g in match.groups() if g is not None), match.group(0)).strip()
+    for g in match.groups():
+        if isinstance(g, str):
+            return g.strip()
+    return match.group(0).strip()
 
 
 # ------------------------------------------------------------------ registry

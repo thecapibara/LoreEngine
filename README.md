@@ -77,38 +77,39 @@ game needs guarantees, not vibes.
 | Layer | API | What it does |
 |---|---|---|
 | **Index** | `engine.index()` | Compact table of contents of every page (~1–2k tokens). Put it in the *stable prefix* of your system prompt — providers cache it, so it's nearly free after turn one. For large KBs, `engine.index("characters")` serves one category at a time (two-layer index). |
-| **Dosing** | `engine.pages_for_entities(names)` | Full pages only for the entities of the *current scene* (fuzzy name matching). Guaranteed relevant. |
+| **Dosing** | `engine.pages_for_entities(names)` | Full pages only for the entities of the *current scene* (strict entity-field matching on keys, titles, aliases, and tags — missing entities never fall back to random body matches). |
 | **Targeted search** | `engine.relevant(action)` | Given the player's action text, pull 1–2 extra pages (like RAG, but deduplicated, capped, deterministic). Expands the query with semantically-related words, so it reaches pages that share *context* with the action even without keyword overlap. |
-| **Wiki-lookup** | `engine.get_pages(queries)` | Let the model itself request pages (e.g. a `wiki_lookup` field in its JSON reply); feed them in next turn. `engine.search_one(query)` exposes the single-best-page lookup. |
+| **Wiki-lookup** | `engine.get_pages(queries)` | Let the model itself request pages (e.g. a `wiki_lookup` field in its JSON reply); feed them in next turn. `engine.search_one(query, entity_only=False)` exposes the single-best-page lookup. |
 
 ## Search machinery
 
 - **BM25 ranking with exact-vs-fuzzy weighting** — rare words matter more than
   common ones, document length and term frequency saturate cleanly, and exact
   matches outrank fuzzy prefix hits;
-- **Transliteration bridge** — file keys are latin (`dark_knight.txt`),
-  player queries can be Cyrillic («Дарк Найт»); language packs map between
-  alphabets;
+- **Transliteration & diacritic folding** — file keys are latin (`dark_knight.txt`),
+  player queries can be Cyrillic («Дарк Найт»), and diacritic-free queries
+  (e.g. Polish `wroclaw` / `krol`) match diacritic forms (`Wrocław` / `król`)
+  across both keys and body text;
 - **Fuzzy prefix matching** — handles case endings and inflection:
   `dragon` ≈ `dragons` ≈ `dragonkin`, and short stems too: `ліс` ≈ `лісу`,
-  `cat` ≈ `cats`. Hyphenated names split into words, so an alias
-  `Jean-Luc Picard` is found by the query `Jean Luc` — but when a split
-  would leave a fragment shorter than 3 chars, the pieces glue back
-  together instead, so `90-ті` stays searchable as `90ті` (and reaches a
-  latin key like `lyhi_90ti` through the transliteration bridge);
+  `cat` ≈ `cats`. Multi-part hyphenated phrases (`Jean-Luc Picard`,
+  `man-at-arms`) and snake_case identifiers split into searchable words, while
+  2-part hyphenated tokens with a short fragment (`< 3` chars) glue back
+  together so `90-ті` stays searchable as `90ті` (and reaches a latin key like
+  `lyhi_90ti` through the transliteration bridge);
 - **Inverted prefix index** — queries narrow to candidate pages via a
   3-char prefix index before the precise BM25 ranker runs. Results are
   identical to a full scan (the index is a guaranteed superset, verified by
-  a differential test), and entity-name lookups stay fast as the KB grows
-  (~5x on 600 pages, ~9x on 2k; no regression when fuzzy matching
-  legitimately keeps every page);
+  a differential test), misses return in O(1) without scanning the corpus, and
+  entity-name lookups stay fast as the KB grows;
 - **Semantic expansion** — a co-occurrence index ("you shall know a word by
-  the company it keeps") links words that share documents. `relevant()`
-  expands the query with the strongest semantic neighbors, weighted below
-  exact keywords, so a player action about *drinks and rumors* can surface a
-  tavern page that never uses those words. Deterministic, no vectors, no
-  model calls. Ties are broken deterministically by page key, so equal
-  scores never depend on filesystem enumeration order.
+  the company it keeps") links words that share documents, weighted by
+  co-occurrence strength and IDF. `relevant()` expands the query with the
+  strongest semantic neighbors using proportional weights below exact keywords,
+  so a player action about *drinks and rumors* can surface a tavern page that
+  never uses those words. Deterministic, no vectors, no model calls. Ties are
+  broken deterministically by `(key, category)` across both `search_one()` and
+  `relevant()`, so equal scores never depend on filesystem enumeration order.
 
 ## Scale
 
@@ -143,10 +144,12 @@ Requires Python 3.9+. No runtime dependencies.
 
 ## Knowledge base layout
 
-One folder per category, one `.txt` per page; the file name is the page key.
-The first line becomes the page's teaser in the index. Pages may declare an
-optional header with explicit aliases and tags (header lines are stripped
-from the dosed content; pages without a header work exactly as before):
+One folder per category, one `.txt` per page (UTF-8, with or without BOM); the
+file name is the page key. The first line becomes the page's teaser in the
+index. Pages may declare an optional header with explicit aliases and tags
+(`Aliases:`/`Tags:`, Ukrainian `Аліаси:`/`Теги:`, or Polish `Aliasy:`/`Tagi:`;
+header lines are stripped from the dosed content; pages without a header work
+exactly as before):
 
 ```text
 Aliases: Ser Aldric, The Dark Knight
@@ -190,15 +193,17 @@ context = "\n\n".join(engine.render(d) for d in pages + extra)
 
 ### `LoreEngine(kb_dir, lang=UK, render_label="WIKI", verbose=True)`
 
-Loads the knowledge base and builds all indexes eagerly.
+Loads the knowledge base (`str` or `os.PathLike[str]`, e.g. `pathlib.Path`) and
+builds all indexes eagerly. When `verbose=True`, diagnostic messages are emitted
+through standard `logging.getLogger("loreengine")` (never `print()` to stdout).
 
 | Method | Returns | Purpose |
 |---|---|---|
 | `index(category=None)` | `str` | Table of contents (all pages or one category) |
 | `category_summary()` | `str` | One-line-per-category overview |
-| `pages_for_entities(names, max_pages=6)` | `List[LoreDocument]` | Dosing: pages for scene entities |
-| `relevant(query, k=2, exclude=())` | `List[LoreDocument]` | Semantic search over the player's action |
-| `search_one(query)` | `LoreDocument \| None` | Single best page for a query |
+| `pages_for_entities(names, max_pages=6)` | `List[LoreDocument]` | Dosing: strict entity-field lookup for scene entities |
+| `relevant(query, k=2, exclude=())` | `List[LoreDocument]` | Semantic search over the player's action (`exclude` accepts `"key"` or `"category/key"`) |
+| `search_one(query, entity_only=False)` | `LoreDocument \| None` | Single best page for a query (full search or entity-only) |
 | `get_pages(queries, max_pages=3)` | `List[LoreDocument]` | Wiki-lookup for model-requested pages |
 | `render(doc)` | `str` | Format a page for prompt injection |
 | `full_text()` | `str` | Entire KB as one block (special cases only) |
@@ -228,12 +233,14 @@ engine = LoreEngine("knowledge_base", lang=DE)
 Dev tool that keeps the wiki consistent:
 
 ```bash
-python -m loreengine knowledge_base --lang en [--strict]
+python -m loreengine knowledge_base --lang en [--allowlist allowlist.txt] [--strict]
+# or via the installed console script:
+loreengine-lint knowledge_base --lang en [--allowlist allowlist.txt] [--strict]
 ```
 
 - cross-references: mentions with no page → warning (allowlist supported);
-- engine self-test: searching each character's canonical name must return
-  its own page (catches transliteration/fuzzy regressions);
+- engine self-test: searching canonical titles across categories must return
+  their own pages (catches transliteration/fuzzy regressions);
 - index guard: warns when the index outgrows the cacheable size and points
   at `engine.index(category)` as the fix;
 - structure: duplicate keys, non-latin keys, oversized pages, duplicate
@@ -258,8 +265,8 @@ wiki you can lint and query right away.
 # Tests (105 tests: search, semantics, scale, linter, CLI, regressions)
 python -m unittest discover -s tests -v
 
-# Type checking (strict; the package ships py.typed)
-python -m mypy loreengine
+# Type checking (strict; the package ships py.typed; install mypy via `pip install -e ".[dev]"`)
+python -m mypy --strict loreengine
 
 # Lint the example KB
 python -m loreengine examples/knowledge_base --lang en
